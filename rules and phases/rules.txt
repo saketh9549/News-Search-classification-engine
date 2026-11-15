@@ -1,0 +1,30 @@
+# ==============================================================================
+# PROJECT: News Crawler & Search Engine Rules
+# ==============================================================================
+
+[DOMAIN CONSTRAINTS & POLITENESS]
+* NEVER execute unrestricted, rapid-fire web scraping.
+* Enforce domain-level politeness: maintain a mandatory delay of at least 5-10 seconds between requests to the same host.
+* Always fetch and respect robots.txt disallow directives before crawling any URL.
+* Set an explicit, identifiable HTTP User-Agent header (e.g., "NewsSearchBot/1.0 (+[suspicious link removed])").
+
+[INGESTION & DEDUPLICATION]
+* Use conditional HTTP headers (If-Modified-Since, If-None-Match/ETag) on all RSS feed requests. Handle HTTP 304 (Not Modified) without re-parsing.
+* Deduplicate at the feed level using XML hash digests and article GUIDs/canonical URLs before inserting into the URL frontier.
+* Ensure all crawl frontier queue operations are idempotent.
+
+[EXTRACTION & DATA QUALITY]
+* Strip boilerplate noise (navigation, ads, social widgets, footers).
+* Validate extracted content before storage: reject documents missing headline or body, or those falling below a minimum threshold (e.g., < 80 words or high link-to-text ratio).
+* Standardize all publication timestamps to ISO 8601 UTC.
+
+[STORAGE & INDEXING]
+* All data must persist permanently in the database (SQLite/PostgreSQL) and search index. Never drop or clear collections during search/ranking operations.
+* Separate database persistence from the search index (Elasticsearch / PyTerrier).
+* Use multi-field indexing: index title, kicker/category, author, published_date, and body as separate fields.
+* Use Okapi BM25 as the default baseline scoring model.
+
+[CODE QUALITY & ERROR HANDLING]
+* All network operations must handle timeouts, HTTP 429 (Rate Limited), and connection resets gracefully with exponential backoff.
+* Separate concerns: keep feed parsing, crawling, extraction, indexing, and search APIs in distinct, decoupled modules.
+* Use type hints and structured schemas (e.g., Pydantic models) for all data exchanged between modules.
