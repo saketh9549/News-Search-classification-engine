@@ -301,9 +301,22 @@ _SEARCH_UI_HTML = r"""<!DOCTYPE html>
     const FALLBACK_TRY = ["climate summit", "semiconductor", "cricket"];
 
     function escapeHtml(text) {
-      const div = document.createElement("div");
-      div.textContent = String(text ?? "");
-      return div.innerHTML;
+      return String(text ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function safeHttpUrl(url) {
+      try {
+        const parsed = new URL(String(url ?? ""), window.location.origin);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          return parsed.href;
+        }
+      } catch (_err) {}
+      return "#";
     }
 
     function capitalizeLabel(label) {
@@ -449,7 +462,7 @@ _SEARCH_UI_HTML = r"""<!DOCTYPE html>
         const shared = l.shared_entities && l.shared_entities.length
           ? ` — Shared: ${escapeHtml(l.shared_entities.join(", "))}`
           : "";
-        return `<li><a href="${escapeHtml(l.canonical_url)}" target="_blank" rel="noopener">${escapeHtml(l.title)}</a>` +
+        return `<li><a href="${escapeHtml(safeHttpUrl(l.canonical_url))}" target="_blank" rel="noopener noreferrer">${escapeHtml(l.title)}</a>` +
           ` (${escapeHtml(l.source || "Unknown")}${l.published_date ? ", " + escapeHtml(formatDateShort(l.published_date)) : ""} · sim ${Number(l.similarity_score).toFixed(2)}${shared})</li>`;
       }).join("");
       return `<ul class="bg-list">${items}</ul>`;
@@ -546,7 +559,7 @@ _SEARCH_UI_HTML = r"""<!DOCTYPE html>
         return `
           <article class="card">
             <div class="card-top">
-              <h2><a href="${escapeHtml(item.canonical_url)}" target="_blank" rel="noopener">${titleHtml}</a></h2>
+              <h2><a href="${escapeHtml(safeHttpUrl(item.canonical_url))}" target="_blank" rel="noopener noreferrer">${titleHtml}</a></h2>
               <div class="score-group">
                 <span class="cat-pill">${catConf}</span>
                 <span class="score-pill">${data.query.trim() ? `Score: ${Number(item.score).toFixed(2)}` : "Filter match"}</span>

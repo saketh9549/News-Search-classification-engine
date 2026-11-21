@@ -258,6 +258,9 @@ def test_fastapi_routes_search_filters_ui_and_evaluation(tmp_path: Path) -> None
         '<select id="source"',
         "corpus-stats",
         "try-pills",
+        "&quot;",
+        "&#39;",
+        "safeHttpUrl",
     ):
         assert expected_marker in ui_html
 
