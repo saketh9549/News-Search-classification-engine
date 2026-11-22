@@ -179,9 +179,12 @@
     .pill:hover { filter: brightness(0.95); }
     .filters {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
-      gap: 10px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
       margin-top: 12px;
+    }
+    @media (max-width: 720px) {
+      .filters { grid-template-columns: 1fr; }
     }
     .filters label {
       display: block;
@@ -291,18 +294,6 @@
     .debug-panel.visible { display: block; }
     .debug-grid { display: grid; grid-template-columns: 150px 1fr; gap: 5px 12px; }
     .debug-key { color: #93c5fd; font-weight: 600; }
-    .entity-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
-    .badge {
-      display: inline-block;
-      background: var(--accent-soft);
-      color: var(--accent-ink);
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 3px 10px;
-      font-size: 0.78rem;
-      font-weight: 500;
-      cursor: pointer;
-    }
     .status-line { color: var(--muted); font-size: 0.88rem; margin-bottom: 10px; }
     .card {
       background: var(--surface);
@@ -551,14 +542,6 @@
               <option value="latest">Newest First (UTC)</option>
             </select>
           </div>
-          <div>
-            <label for="date_from">Date From (UTC)</label>
-            <input id="date_from" type="date" />
-          </div>
-          <div>
-            <label for="date_to">Date To (UTC)</label>
-            <input id="date_to" type="date" />
-          </div>
         </div>
         <div class="controls-row">
           <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center;">
@@ -572,8 +555,6 @@
             </label>
           </div>
           <div style="display:flex; gap:6px; flex-wrap:wrap;">
-            <button type="button" class="btn-secondary date-preset" data-days="7">Last 7d</button>
-            <button type="button" class="btn-secondary date-preset" data-days="30">Last 30d</button>
             <button type="button" id="reset-filters" class="btn-secondary">Reset Filters</button>
           </div>
         </div>
@@ -595,8 +576,7 @@
           <div id="live-progress" class="live-progress"></div>
           <div id="did-you-mean" class="did-you-mean"></div>
           <div id="ir-debug-panel" class="debug-panel"></div>
-          <div id="entities" class="entity-bar"></div>
-          <div id="status" class="status-line">Enter keywords or select a category, source, or date filter.</div>
+          <div id="status" class="status-line">Enter keywords or select a category or source filter.</div>
           <div id="results"></div>
         </main>
       </div>
@@ -741,8 +721,6 @@
     const categorySelect = document.getElementById("category");
     const sourceSelect = document.getElementById("source");
     const sortSelect = document.getElementById("sort");
-    const dateFromInput = document.getElementById("date_from");
-    const dateToInput = document.getElementById("date_to");
     const debugToggle = document.getElementById("debug-toggle");
     const liveCrawlToggle = document.getElementById("live-crawl-toggle");
     const forceLiveBtn = document.getElementById("force-live-btn");
@@ -750,7 +728,6 @@
     const debugPanel = document.getElementById("ir-debug-panel");
     const dymEl = document.getElementById("did-you-mean");
     const resultsEl = document.getElementById("results");
-    const entitiesEl = document.getElementById("entities");
     const statusEl = document.getElementById("status");
     const corpusStatsEl = document.getElementById("corpus-stats");
     const tryPillsEl = document.getElementById("try-pills");
@@ -802,17 +779,14 @@
       return Boolean(
         categorySelect.value.trim()
         || sourceSelect.value.trim()
-        || dateFromInput.value.trim()
-        || dateToInput.value.trim()
       );
     }
 
     function clearToIdle() {
       closeLiveStream();
       setLiveProgress(null, "");
-      statusEl.textContent = "Enter keywords or select a category, source, or date filter.";
+      statusEl.textContent = "Enter keywords or select a category or source filter.";
       resultsEl.innerHTML = "";
-      entitiesEl.innerHTML = "";
       dymEl.classList.remove("visible");
       dymEl.innerHTML = "";
       renderDebugPanel(null);
@@ -858,17 +832,10 @@
 
     function renderOverview(overview) {
       cachedOverview = overview;
-      const windowText = (overview.date_min && overview.date_max)
-        ? `${formatDateShort(overview.date_min)} – ${formatDateShort(overview.date_max)}`
-        : "No dates indexed";
       corpusStatsEl.innerHTML =
         `<span><strong>Indexed:</strong> ${overview.doc_count} article(s)</span>` +
         `<span><strong>Sources:</strong> ${overview.sources.length}</span>` +
-        `<span><strong>Categories:</strong> ${overview.categories.length}</span>` +
-        `<span><strong>Crawl Window (UTC):</strong> ${escapeHtml(windowText)}</span>`;
-
-      if (overview.date_min) dateFromInput.min = overview.date_min.slice(0, 10);
-      if (overview.date_max) dateToInput.max = overview.date_max.slice(0, 10);
+        `<span><strong>Categories:</strong> ${overview.categories.length}</span>`;
 
       populateSelect(categorySelect, "All Categories", overview.categories, categorySelect.value);
       populateSelect(sourceSelect, "All Sources", overview.sources, sourceSelect.value);
@@ -976,10 +943,6 @@
         ? `${data.total_hits} result(s) for "${data.query}"${execTime}`
         : `Showing ${data.total_hits} filtered article(s)${execTime}`;
 
-      entitiesEl.innerHTML = (data.top_entities || []).map(ent =>
-        `<button type="button" class="badge entity-trigger" data-entity="${escapeHtml(ent.text)}">${escapeHtml(ent.label)}: ${escapeHtml(ent.text)} (${ent.count})</button>`
-      ).join("");
-
       if (!data.results.length) {
         const retryTarget = data.query.trim() ? ` &amp; retry "${escapeHtml(data.query)}"` : "";
         const filterHint = (data.unfiltered_total_hits && data.unfiltered_total_hits > 0)
@@ -994,8 +957,6 @@
           clearRetry.addEventListener("click", () => {
             categorySelect.value = "";
             sourceSelect.value = "";
-            dateFromInput.value = "";
-            dateToInput.value = "";
             runSearch({ triggerLive: false });
           });
         }
@@ -1124,8 +1085,6 @@
       for (const [key, el] of [
         ["category", categorySelect],
         ["source", sourceSelect],
-        ["date_from", dateFromInput],
-        ["date_to", dateToInput],
       ]) {
         const val = el.value.trim();
         if (val) params.set(key, val);
@@ -1165,7 +1124,7 @@
       if (!qInput.value.trim()) { qInput.focus(); return; }
       runSearch({ triggerLive: true, forcePoll: true });
     });
-    for (const el of [categorySelect, sourceSelect, sortSelect, dateFromInput, dateToInput]) {
+    for (const el of [categorySelect, sourceSelect, sortSelect]) {
       el.addEventListener("change", () => {
         if (qInput.value.trim() || hasActiveFilters()) runSearch({ triggerLive: false });
         else { renderOverviewSync(); clearToIdle(); }
@@ -1176,22 +1135,10 @@
       categorySelect.value = "";
       sourceSelect.value = "";
       sortSelect.value = "relevance";
-      dateFromInput.value = "";
-      dateToInput.value = "";
       renderOverviewSync();
       if (qInput.value.trim()) runSearch();
       else clearToIdle();
     });
-    for (const preset of document.querySelectorAll(".date-preset")) {
-      preset.addEventListener("click", () => {
-        const days = Number(preset.dataset.days || 7);
-        const now = new Date();
-        const past = new Date(now.getTime() - days * 86400000);
-        dateToInput.value = now.toISOString().slice(0, 10);
-        dateFromInput.value = past.toISOString().slice(0, 10);
-        runSearch();
-      });
-    }
 
     // TAB 2: Live ML Classifier & Retrieval Benchmark
     async function loadClassifierMetrics() {
