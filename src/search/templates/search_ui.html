@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>News Search Engine — Classification, BM25, NER &amp; Background Linking</title>
+  <style>
+    :root {
+      --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --bg: #f6f8fb;
+      --surface: #ffffff;
+      --surface-alt: #f1f5f9;
+      --ink: #0f172a;
+      --muted: #475569;
+      --subtle: #64748b;
+      --border: #dbe3ee;
+      --accent: #1d4ed8;
+      --accent-hover: #1e40af;
+      --accent-soft: #eff6ff;
+      --accent-ink: #1e3a8a;
+      --mark: #fef08a;
+      --mark-ink: #713f12;
+      --ok-bg: #ecfdf5;
+      --ok-ink: #065f46;
+      --warn-bg: #fffbeb;
+      --warn-ink: #92400e;
+      --code-bg: #0f172a;
+      --code-ink: #e2e8f0;
+      --shadow: 0 2px 10px rgba(15, 23, 42, 0.06);
+    }
+    [data-theme="dark"] {
+      --bg: #0b1120;
+      --surface: #111827;
+      --surface-alt: #1e293b;
+      --ink: #f1f5f9;
+      --muted: #cbd5e1;
+      --subtle: #94a3b8;
+      --border: #263348;
+      --accent: #3b82f6;
+      --accent-hover: #60a5fa;
+      --accent-soft: rgba(59, 130, 246, 0.16);
+      --accent-ink: #93c5fd;
+      --mark: #fde047;
+      --mark-ink: #422006;
+      --ok-bg: rgba(16, 185, 129, 0.16);
+      --ok-ink: #6ee7b7;
+      --warn-bg: rgba(245, 158, 11, 0.18);
+      --warn-ink: #fcd34d;
+      --code-bg: #030712;
+      --code-ink: #e2e8f0;
+      --shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.5;
+    }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px 16px 56px; }
+    header.topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .brand h1 { margin: 0; font-size: 1.65rem; letter-spacing: -0.02em; }
+    .brand .subtitle { margin: 3px 0 0; color: var(--muted); font-size: 0.9rem; }
+    .nav-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .tabs {
+      display: inline-flex;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 3px;
+      gap: 3px;
+    }
+    .tab-btn {
+      background: transparent;
+      color: var(--muted);
+      border: none;
+      border-radius: 7px;
+      padding: 7px 13px;
+      font-size: 0.86rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .tab-btn.active { background: var(--accent); color: #fff; }
+    .theme-btn {
+      background: var(--surface);
+      color: var(--ink);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 7px 11px;
+      font-size: 0.86rem;
+      cursor: pointer;
+    }
+    .coverage-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      align-items: center;
+      padding: 9px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+    .coverage-bar strong { color: var(--ink); }
+    .view-pane { display: none; }
+    .view-pane.active { display: block; }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: var(--shadow);
+      margin-bottom: 16px;
+    }
+    .search-row { display: flex; gap: 8px; }
+    .search-row input[type="search"] {
+      flex: 1;
+      padding: 11px 13px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 1rem;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 18px;
+      font-weight: 600;
+      font-size: 0.92rem;
+      cursor: pointer;
+    }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-secondary {
+      background: var(--surface-alt);
+      color: var(--ink);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 7px 12px;
+      font-size: 0.84rem;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .try-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-top: 10px;
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border: 1px solid var(--border);
+      background: var(--accent-soft);
+      color: var(--accent-ink);
+      border-radius: 999px;
+      padding: 4px 11px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .pill:hover { filter: brightness(0.95); }
+    .filters {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .filters label {
+      display: block;
+      font-size: 0.74rem;
+      font-weight: 700;
+      color: var(--subtle);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 4px;
+    }
+    .filters select, .filters input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      color: var(--ink);
+      font-size: 0.88rem;
+    }
+    .controls-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+      font-size: 0.85rem;
+    }
+    .debug-toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--muted); }
+    .layout {
+      display: grid;
+      grid-template-columns: 235px minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
+    .sidebar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .facet-group + .facet-group {
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .facet-group h3 {
+      margin: 0 0 8px;
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--subtle);
+    }
+    .facet-list { display: flex; flex-direction: column; gap: 4px; }
+    .facet-btn {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      padding: 6px 8px;
+      font-size: 0.85rem;
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .facet-btn:hover { background: var(--surface-alt); }
+    .facet-btn.active {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+      font-weight: 600;
+    }
+    .facet-count {
+      font-size: 0.75rem;
+      background: var(--surface-alt);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 1px 7px;
+    }
+    .did-you-mean {
+      display: none;
+      margin-bottom: 12px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: var(--warn-bg);
+      color: var(--warn-ink);
+      border: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+    .did-you-mean.visible { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .debug-panel {
+      display: none;
+      margin-bottom: 14px;
+      padding: 12px 14px;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      border-radius: 10px;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+    }
+    .debug-panel.visible { display: block; }
+    .debug-grid { display: grid; grid-template-columns: 150px 1fr; gap: 5px 12px; }
+    .debug-key { color: #93c5fd; font-weight: 600; }
+    .entity-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+    .badge {
+      display: inline-block;
+      background: var(--accent-soft);
+      color: var(--accent-ink);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 0.78rem;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .status-line { color: var(--muted); font-size: 0.88rem; margin-bottom: 10px; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 12px;
+      box-shadow: var(--shadow);
+    }
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .card h2 { margin: 0; font-size: 1.08rem; flex: 1; min-width: 220px; }
+    .card h2 a { color: var(--ink); text-decoration: none; }
+    .card h2 a:hover { color: var(--accent); text-decoration: underline; }
+    .score-group { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .score-pill {
+      background: var(--accent-soft);
+      color: var(--accent-ink);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 0.76rem;
+      font-weight: 700;
+    }
+    .cat-pill {
+      background: var(--ok-bg);
+      color: var(--ok-ink);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 0.76rem;
+      font-weight: 700;
+    }
+    .cat-pill.borderline {
+      background: var(--warn-bg);
+      color: var(--warn-ink);
+      border-style: dashed;
+    }
+    .new-pill {
+      background: #16a34a;
+      color: #ffffff;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 0.74rem;
+      font-weight: 700;
+    }
+    .live-progress {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      margin-bottom: 12px;
+      border-radius: 10px;
+      background: var(--accent-soft);
+      color: var(--accent-ink);
+      border: 1px solid var(--border);
+      font-size: 0.86rem;
+      font-weight: 500;
+    }
+    .live-progress.visible { display: flex; }
+    .live-progress.done { background: var(--ok-bg); color: var(--ok-ink); }
+    .live-progress.err { background: var(--warn-bg); color: var(--warn-ink); }
+    .pulse-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--accent);
+      flex-shrink: 0;
+      animation: pulse 1.2s infinite ease-in-out;
+    }
+    .live-progress.done .pulse-dot { background: #16a34a; animation: none; }
+    @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.15); } }
+    .meta { color: var(--muted); font-size: 0.82rem; margin: 5px 0 8px; }
+    .field-breakdown { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0 9px; }
+    .field-chip {
+      font-size: 0.73rem;
+      background: var(--surface-alt);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px 7px;
+      font-family: var(--font-mono);
+    }
+    .snippet { font-size: 0.93rem; margin: 6px 0 10px; color: var(--ink); }
+    mark {
+      background: var(--mark);
+      color: var(--mark-ink);
+      padding: 0 1px;
+      border-radius: 2px;
+      font-weight: 600;
+      box-decoration-break: clone;
+      -webkit-box-decoration-break: clone;
+    }
+    .card-entities { display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 10px; }
+    .entity-chip {
+      background: var(--surface-alt);
+      color: var(--ink);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 2px 9px;
+      font-size: 0.74rem;
+      cursor: pointer;
+    }
+    .entity-chip:hover { border-color: var(--accent); color: var(--accent); }
+    .card-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+    .bg-drawer { flex: 1; min-width: 240px; }
+    .bg-drawer summary { cursor: pointer; font-size: 0.84rem; font-weight: 600; color: var(--accent); }
+    .bg-list { margin: 8px 0 0; padding-left: 18px; font-size: 0.84rem; color: var(--muted); }
+    .bg-list li { margin-bottom: 5px; }
+    .bg-list a { color: var(--ink); font-weight: 500; text-decoration: none; }
+    .bg-list a:hover { color: var(--accent); text-decoration: underline; }
+    .empty-state {
+      background: var(--surface);
+      border: 1px dashed var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      text-align: center;
+    }
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .kpi-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .kpi-label { font-size: 0.76rem; color: var(--subtle); text-transform: uppercase; font-weight: 700; }
+    .kpi-val { font-size: 1.55rem; font-weight: 800; margin-top: 4px; color: var(--accent); }
+    .kpi-sub { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .table-wrap { overflow-x: auto; }
+    table.data-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+    }
+    table.data-table th, table.data-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+    }
+    table.data-table th { background: var(--surface-alt); color: var(--muted); font-weight: 700; }
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.65);
+      z-index: 100;
+      justify-content: center;
+      align-items: center;
+      padding: 16px;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal-box {
+      background: var(--surface);
+      color: var(--ink);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      max-width: 780px;
+      width: 100%;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+    }
+    .modal-head {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .modal-head h2 { margin: 0; font-size: 1.15rem; }
+    .modal-body { padding: 16px 18px; overflow-y: auto; font-size: 0.95rem; }
+    .modal-foot {
+      padding: 12px 18px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="topbar">
+      <div class="brand">
+        <h1>News Search Engine</h1>
+        <p class="subtitle">Multi-field Okapi BM25 · Supervised ML News Classifier · Debiased NER &amp; TF-IDF Background Linking</p>
+      </div>
+      <div class="nav-right">
+        <div class="tabs" role="tablist">
+          <button type="button" class="tab-btn active" data-tab="search">Search</button>
+          <button type="button" class="tab-btn" data-tab="metrics">ML &amp; IR Evaluation</button>
+          <button type="button" class="tab-btn" data-tab="crawler">Crawler &amp; Corpus</button>
+        </div>
+        <button type="button" id="theme-toggle" class="theme-btn" title="Toggle light/dark theme">Dark Mode</button>
+      </div>
+    </header>
+
+    <div id="corpus-stats" class="coverage-bar">Loading corpus statistics...</div>
+
+    <!-- TAB 1: SEARCH -->
+    <section id="pane-search" class="view-pane active">
+      <form class="panel" id="search-form">
+        <div class="search-row">
+          <input id="q" name="q" type="search" placeholder='Search news topics, breaking stories, entities, or "exact phrases" (press / to focus)...' autocomplete="off" />
+          <button type="submit" class="btn-primary">Search</button>
+          <button type="button" id="force-live-btn" class="btn-secondary" title="Force fresh RSS poll and crawl matching news links now">Fetch Fresh</button>
+        </div>
+        <div class="try-row" id="try-pills"><span>Try:</span></div>
+        <div class="filters">
+          <div>
+            <label for="category">Category (ML Classified)</label>
+            <select id="category"><option value="">All Categories</option></select>
+          </div>
+          <div>
+            <label for="source">Source Outlet</label>
+            <select id="source"><option value="">All Sources</option></select>
+          </div>
+          <div>
+            <label for="sort">Sort By</label>
+            <select id="sort">
+              <option value="relevance">Relevance (BM25 + Recency)</option>
+              <option value="latest">Newest First (UTC)</option>
+            </select>
+          </div>
+          <div>
+            <label for="date_from">Date From (UTC)</label>
+            <input id="date_from" type="date" />
+          </div>
+          <div>
+            <label for="date_to">Date To (UTC)</label>
+            <input id="date_to" type="date" />
+          </div>
+        </div>
+        <div class="controls-row">
+          <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center;">
+            <label class="debug-toggle">
+              <input type="checkbox" id="live-crawl-toggle" checked />
+              <strong>Live Crawl from News Links</strong> (auto-fetch fresh matching stories)
+            </label>
+            <label class="debug-toggle">
+              <input type="checkbox" id="debug-toggle" />
+              Show IR Debug Info
+            </label>
+          </div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            <button type="button" class="btn-secondary date-preset" data-days="7">Last 7d</button>
+            <button type="button" class="btn-secondary date-preset" data-days="30">Last 30d</button>
+            <button type="button" id="reset-filters" class="btn-secondary">Reset Filters</button>
+          </div>
+        </div>
+      </form>
+
+      <div class="layout">
+        <aside class="sidebar" id="facet-sidebar">
+          <div class="facet-group">
+            <h3>Categories</h3>
+            <div class="facet-list" id="category-facets"><span class="meta">Loading...</span></div>
+          </div>
+          <div class="facet-group">
+            <h3>Sources</h3>
+            <div class="facet-list" id="source-facets"><span class="meta">Loading...</span></div>
+          </div>
+        </aside>
+
+        <main>
+          <div id="live-progress" class="live-progress"></div>
+          <div id="did-you-mean" class="did-you-mean"></div>
+          <div id="ir-debug-panel" class="debug-panel"></div>
+          <div id="entities" class="entity-bar"></div>
+          <div id="status" class="status-line">Enter keywords or select a category, source, or date filter.</div>
+          <div id="results"></div>
+        </main>
+      </div>
+    </section>
+
+    <!-- TAB 2: ML CLASSIFIER & IR EVALUATION -->
+    <section id="pane-metrics" class="view-pane">
+      <div class="panel">
+        <h2 style="margin:0 0 6px; font-size:1.15rem;">Supervised ML News Classifier (Stratified K-Fold CV)</h2>
+        <p id="clf-subtitle" class="meta" style="margin:0 0 12px;">Loading trained classifier metrics...</p>
+        <div class="kpi-grid" id="clf-kpis"></div>
+        <div class="table-wrap" id="clf-table-wrap"></div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+          <div>
+            <h2 style="margin:0 0 4px; font-size:1.15rem;">Information Retrieval Benchmark (TREC Metrics)</h2>
+            <p class="meta" style="margin:0;">Evaluates BM25 ranking against curated relevance judgments (MAP, nDCG@10, MRR, Precision/Recall@10).</p>
+          </div>
+          <button type="button" id="run-eval-btn" class="btn-primary">Run Retrieval Benchmark</button>
+        </div>
+        <div class="kpi-grid" id="eval-kpis">
+          <div class="kpi-card"><div class="kpi-label">MAP</div><div class="kpi-val" id="kpi-map">—</div></div>
+          <div class="kpi-card"><div class="kpi-label">Mean nDCG@10</div><div class="kpi-val" id="kpi-ndcg">—</div></div>
+          <div class="kpi-card"><div class="kpi-label">MRR</div><div class="kpi-val" id="kpi-mrr">—</div></div>
+          <div class="kpi-card"><div class="kpi-label">Precision@10</div><div class="kpi-val" id="kpi-p10">—</div></div>
+          <div class="kpi-card"><div class="kpi-label">Recall@10</div><div class="kpi-val" id="kpi-r10">—</div></div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr><th>Query</th><th>P@10</th><th>R@10</th><th>AP</th><th>nDCG@10</th><th>RR</th></tr>
+            </thead>
+            <tbody id="eval-table-body">
+              <tr><td colspan="6" class="meta">Click "Run Retrieval Benchmark" to evaluate live search performance.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: LIVE CRAWLER & CORPUS HEALTH -->
+    <section id="pane-crawler" class="view-pane">
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+          <div>
+            <h2 style="margin:0 0 4px; font-size:1.15rem;">Live Crawler Frontier &amp; Feed Health</h2>
+            <p class="meta" style="margin:0;">Real-time metrics read directly from SQLite (<code>rss_feeds</code>, <code>crawl_frontier</code>, <code>articles</code>).</p>
+          </div>
+          <button type="button" id="refresh-stats-btn" class="btn-secondary">Refresh Live Stats</button>
+        </div>
+        <div class="kpi-grid" id="crawler-kpis"></div>
+        <div class="table-wrap" id="crawler-feeds-wrap"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- FULL ARTICLE READER MODAL -->
+  <div id="article-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal-box">
+      <div class="modal-head">
+        <div>
+          <h2 id="modal-title">Article</h2>
+          <div class="meta" id="modal-meta"></div>
+        </div>
+        <button type="button" id="modal-close" class="btn-secondary">Close</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-foot">
+        <span id="modal-entities"></span>
+        <a id="modal-source-link" href="#" target="_blank" rel="noopener noreferrer">Open Original Article &rarr;</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function escapeHtml(text) {
+      return String(text ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function safeHttpUrl(url) {
+      try {
+        const parsed = new URL(String(url ?? ""), window.location.origin);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          return parsed.href;
+        }
+      } catch (_err) {}
+      return "#";
+    }
+
+    function capitalizeLabel(label) {
+      if (!label) return "General";
+      return String(label).replace(/_/g, " & ").replace(/\b\w/g, c => c.toUpperCase());
+    }
+
+    function formatDateShort(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return String(iso).slice(0, 10);
+      return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+    }
+
+    // Theme
+    const themeBtn = document.getElementById("theme-toggle");
+    function applyTheme(theme) {
+      document.documentElement.setAttribute("data-theme", theme);
+      localStorage.setItem("news_search_theme", theme);
+      themeBtn.textContent = theme === "dark" ? "Light Mode" : "Dark Mode";
+    }
+    applyTheme(localStorage.getItem("news_search_theme") || "light");
+    themeBtn.addEventListener("click", () => {
+      const cur = document.documentElement.getAttribute("data-theme");
+      applyTheme(cur === "dark" ? "light" : "dark");
+    });
+
+    // Tabs
+    const tabBtns = document.querySelectorAll(".tab-btn");
+    const panes = {
+      search: document.getElementById("pane-search"),
+      metrics: document.getElementById("pane-metrics"),
+      crawler: document.getElementById("pane-crawler"),
+    };
+    tabBtns.forEach(btn => {
+      btn.addEventListener("click", () => {
+        tabBtns.forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        const tab = btn.dataset.tab;
+        Object.entries(panes).forEach(([k, el]) => el.classList.toggle("active", k === tab));
+        if (tab === "metrics") loadClassifierMetrics();
+        if (tab === "crawler") loadCrawlerStats();
+      });
+    });
+
+    const form = document.getElementById("search-form");
+    const qInput = document.getElementById("q");
+    const categorySelect = document.getElementById("category");
+    const sourceSelect = document.getElementById("source");
+    const sortSelect = document.getElementById("sort");
+    const dateFromInput = document.getElementById("date_from");
+    const dateToInput = document.getElementById("date_to");
+    const debugToggle = document.getElementById("debug-toggle");
+    const liveCrawlToggle = document.getElementById("live-crawl-toggle");
+    const forceLiveBtn = document.getElementById("force-live-btn");
+    const liveProgressEl = document.getElementById("live-progress");
+    const debugPanel = document.getElementById("ir-debug-panel");
+    const dymEl = document.getElementById("did-you-mean");
+    const resultsEl = document.getElementById("results");
+    const entitiesEl = document.getElementById("entities");
+    const statusEl = document.getElementById("status");
+    const corpusStatsEl = document.getElementById("corpus-stats");
+    const tryPillsEl = document.getElementById("try-pills");
+    const categoryFacetsEl = document.getElementById("category-facets");
+    const sourceFacetsEl = document.getElementById("source-facets");
+    const resetBtn = document.getElementById("reset-filters");
+
+    const modal = document.getElementById("article-modal");
+    const modalTitle = document.getElementById("modal-title");
+    const modalMeta = document.getElementById("modal-meta");
+    const modalBody = document.getElementById("modal-body");
+    const modalEntities = document.getElementById("modal-entities");
+    const modalSourceLink = document.getElementById("modal-source-link");
+    const modalClose = document.getElementById("modal-close");
+
+    let lastDebug = null;
+    let cachedOverview = null;
+    let activeLiveStream = null;
+    const FALLBACK_TRY = ["climate change", "nvidia", "cricket", "india", "ukraine"];
+
+    function closeLiveStream() {
+      if (activeLiveStream) {
+        activeLiveStream.close();
+        activeLiveStream = null;
+      }
+    }
+
+    function setLiveProgress(state, text) {
+      if (!state) {
+        liveProgressEl.className = "live-progress";
+        liveProgressEl.innerHTML = "";
+        return;
+      }
+      liveProgressEl.className = `live-progress visible${state === "done" ? " done" : (state === "err" ? " err" : "")}`;
+      liveProgressEl.innerHTML = `<span class="pulse-dot"></span><span>${escapeHtml(text)}</span>`;
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "/" && document.activeElement !== qInput && !modal.classList.contains("open")) {
+        e.preventDefault();
+        qInput.focus();
+      }
+      if (e.key === "Escape" && modal.classList.contains("open")) {
+        modal.classList.remove("open");
+      }
+    });
+
+    function hasActiveFilters() {
+      return Boolean(
+        categorySelect.value.trim()
+        || sourceSelect.value.trim()
+        || dateFromInput.value.trim()
+        || dateToInput.value.trim()
+      );
+    }
+
+    function clearToIdle() {
+      closeLiveStream();
+      setLiveProgress(null, "");
+      statusEl.textContent = "Enter keywords or select a category, source, or date filter.";
+      resultsEl.innerHTML = "";
+      entitiesEl.innerHTML = "";
+      dymEl.classList.remove("visible");
+      dymEl.innerHTML = "";
+      renderDebugPanel(null);
+    }
+
+    function populateSelect(selectEl, defaultLabel, buckets, currentVal) {
+      const opts = [`<option value="">${escapeHtml(defaultLabel)}</option>`];
+      for (const b of buckets) {
+        const selected = b.name === currentVal ? " selected" : "";
+        opts.push(`<option value="${escapeHtml(b.name)}"${selected}>${escapeHtml(capitalizeLabel(b.name))} (${b.count})</option>`);
+      }
+      selectEl.innerHTML = opts.join("");
+    }
+
+    function renderFacetList(container, buckets, activeVal, selectEl, prettify) {
+      if (!buckets || !buckets.length) {
+        container.innerHTML = `<span class="meta">No facets indexed yet</span>`;
+        return;
+      }
+      const allBtn = `<button type="button" class="facet-btn${!activeVal ? " active" : ""}" data-val=""><span>All</span></button>`;
+      const items = buckets.map(b => {
+        const isActive = b.name === activeVal ? " active" : "";
+        const label = prettify ? capitalizeLabel(b.name) : b.name;
+        return `<button type="button" class="facet-btn${isActive}" data-val="${escapeHtml(b.name)}"><span>${escapeHtml(label)}</span><span class="facet-count">${b.count}</span></button>`;
+      });
+      container.innerHTML = allBtn + items.join("");
+      for (const btn of container.querySelectorAll(".facet-btn")) {
+        btn.addEventListener("click", () => {
+          const val = btn.dataset.val || "";
+          selectEl.value = (val && selectEl.value === val) ? "" : val;
+          if (qInput.value.trim() || hasActiveFilters()) runSearch();
+          else {
+            renderOverviewSync();
+            clearToIdle();
+          }
+        });
+      }
+    }
+
+    function renderOverviewSync() {
+      if (cachedOverview) renderOverview(cachedOverview);
+    }
+
+    function renderOverview(overview) {
+      cachedOverview = overview;
+      const windowText = (overview.date_min && overview.date_max)
+        ? `${formatDateShort(overview.date_min)} – ${formatDateShort(overview.date_max)}`
+        : "No dates indexed";
+      corpusStatsEl.innerHTML =
+        `<span><strong>Indexed:</strong> ${overview.doc_count} article(s)</span>` +
+        `<span><strong>Sources:</strong> ${overview.sources.length}</span>` +
+        `<span><strong>Categories:</strong> ${overview.categories.length}</span>` +
+        `<span><strong>Crawl Window (UTC):</strong> ${escapeHtml(windowText)}</span>`;
+
+      if (overview.date_min) dateFromInput.min = overview.date_min.slice(0, 10);
+      if (overview.date_max) dateToInput.max = overview.date_max.slice(0, 10);
+
+      populateSelect(categorySelect, "All Categories", overview.categories, categorySelect.value);
+      populateSelect(sourceSelect, "All Sources", overview.sources, sourceSelect.value);
+      renderFacetList(categoryFacetsEl, overview.categories, categorySelect.value, categorySelect, true);
+      renderFacetList(sourceFacetsEl, overview.sources, sourceSelect.value, sourceSelect, false);
+
+      const samples = (overview.sample_queries && overview.sample_queries.length) ? overview.sample_queries : FALLBACK_TRY;
+      tryPillsEl.innerHTML = `<span>Try:</span>` + samples.map(q =>
+        `<button type="button" class="pill try-pill" data-query="${escapeHtml(q)}">${escapeHtml(q)}</button>`
+      ).join("");
+      for (const pill of tryPillsEl.querySelectorAll(".try-pill")) {
+        pill.addEventListener("click", () => triggerQuery(pill.dataset.query || ""));
+      }
+    }
+
+    function renderDebugPanel(debug) {
+      lastDebug = debug;
+      if (!debugToggle.checked || !debug) {
+        debugPanel.classList.remove("visible");
+        debugPanel.innerHTML = "";
+        return;
+      }
+      const expansions = Object.entries(debug.expanded_terms || {})
+        .map(([k, v]) => `${k} -> [${v.join(", ")}]`).join("; ") || "none";
+      const weights = Object.entries(debug.field_weights || {})
+        .map(([f, w]) => `${f}: ${w}x`).join(" · ");
+      debugPanel.classList.add("visible");
+      debugPanel.innerHTML = `
+        <div class="debug-grid">
+          <div class="debug-key">Execution Time:</div><div>${debug.execution_time_ms.toFixed(2)} ms</div>
+          <div class="debug-key">Raw Tokens:</div><div>[${escapeHtml((debug.raw_tokens || []).join(", "))}]</div>
+          <div class="debug-key">Stopwords Removed:</div><div>[${escapeHtml((debug.removed_stopwords || []).join(", ")) || "none"}]</div>
+          <div class="debug-key">Porter Stems:</div><div>[${escapeHtml((debug.stemmed_tokens || []).join(", "))}]</div>
+          <div class="debug-key">Expanded Terms:</div><div>${escapeHtml(expansions)}</div>
+          <div class="debug-key">Final BM25 Terms:</div><div>[${escapeHtml((debug.final_terms || []).join(", "))}]</div>
+          <div class="debug-key">Field Weights:</div><div>${escapeHtml(weights)}</div>
+        </div>`;
+    }
+
+    function triggerQuery(queryText) {
+      qInput.value = queryText;
+      runSearch();
+    }
+
+    function renderBackgroundList(links) {
+      if (!links || !links.length) {
+        return `<p class="meta" style="margin:6px 0 0;">No closely related background stories found in current index.</p>`;
+      }
+      const items = links.map(l => {
+        const shared = l.shared_entities && l.shared_entities.length
+          ? ` — Shared: ${escapeHtml(l.shared_entities.join(", "))}`
+          : "";
+        return `<li><a href="${escapeHtml(safeHttpUrl(l.canonical_url))}" target="_blank" rel="noopener noreferrer">${escapeHtml(l.title)}</a>` +
+          ` (${escapeHtml(l.source || "Unknown")}${l.published_date ? ", " + escapeHtml(formatDateShort(l.published_date)) : ""} · sim ${Number(l.similarity_score).toFixed(2)}${shared})</li>`;
+      }).join("");
+      return `<ul class="bg-list">${items}</ul>`;
+    }
+
+    async function openArticleModal(docId) {
+      modal.classList.add("open");
+      modalTitle.textContent = "Loading article...";
+      modalMeta.textContent = "";
+      modalBody.innerHTML = "<p>Loading full article text...</p>";
+      modalEntities.textContent = "";
+      modalSourceLink.style.display = "none";
+      try {
+        const res = await fetch(`/api/articles/${encodeURIComponent(docId)}`);
+        if (!res.ok) {
+          modalBody.innerHTML = `<p>Error loading article (HTTP ${res.status}).</p>`;
+          return;
+        }
+        const doc = await res.json();
+        modalTitle.textContent = doc.title;
+        modalMeta.textContent = `${doc.source || "Unknown"} · ${doc.author ? "By " + doc.author + " · " : ""}${formatDateShort(doc.published_date) || "Undated"}`;
+        const paras = String(doc.body_text || "").split(/\n\s*\n/).filter(Boolean);
+        modalBody.innerHTML = paras.map(p => `<p>${escapeHtml(p)}</p>`).join("");
+        modalEntities.textContent = `${(doc.entities || []).length} extracted entities`;
+        modalSourceLink.href = safeHttpUrl(doc.canonical_url);
+        modalSourceLink.style.display = "inline";
+      } catch (_err) {
+        modalBody.innerHTML = "<p>Network error while loading article.</p>";
+      }
+    }
+
+    modalClose.addEventListener("click", () => modal.classList.remove("open"));
+    modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.remove("open"); });
+
+    function renderSearchData(data, newDocIds) {
+      const freshSet = new Set(newDocIds || []);
+      if (data.facets) renderOverview(data.facets);
+      renderDebugPanel(data.query_debug);
+
+      if (data.did_you_mean) {
+        dymEl.classList.add("visible");
+        dymEl.innerHTML = `<span>Did you mean:</span> <button type="button" class="pill" id="dym-btn" data-query="${escapeHtml(data.did_you_mean)}">${escapeHtml(data.did_you_mean)}</button>`;
+        const dymBtn = document.getElementById("dym-btn");
+        if (dymBtn) dymBtn.addEventListener("click", () => triggerQuery(dymBtn.dataset.query || ""));
+      } else {
+        dymEl.classList.remove("visible");
+        dymEl.innerHTML = "";
+      }
+
+      const execTime = data.query_debug ? ` in ${data.query_debug.execution_time_ms.toFixed(1)} ms` : "";
+      statusEl.textContent = data.query.trim()
+        ? `${data.total_hits} result(s) for "${data.query}"${execTime}`
+        : `Showing ${data.total_hits} filtered article(s)${execTime}`;
+
+      entitiesEl.innerHTML = (data.top_entities || []).map(ent =>
+        `<button type="button" class="badge entity-trigger" data-entity="${escapeHtml(ent.text)}">${escapeHtml(ent.label)}: ${escapeHtml(ent.text)} (${ent.count})</button>`
+      ).join("");
+
+      if (!data.results.length) {
+        const retryTarget = data.query.trim() ? ` &amp; retry "${escapeHtml(data.query)}"` : "";
+        const filterHint = (data.unfiltered_total_hits && data.unfiltered_total_hits > 0)
+          ? `<p>Active filters hid <strong>${data.unfiltered_total_hits}</strong> matching article(s). <button type="button" class="pill" id="clear-retry-btn">Clear filters${retryTarget}</button></p>`
+          : `<p>No documents matched all query terms yet. Live crawl checks registered news links automatically when enabled, or try a suggestion below:</p>`;
+        const sugPills = (data.suggestions || []).map(s =>
+          `<button type="button" class="pill sug-pill" data-query="${escapeHtml(s)}">${escapeHtml(s)}</button>`
+        ).join(" ");
+        resultsEl.innerHTML = `<div class="empty-state"><h3>No matching results found</h3>${filterHint}<div class="try-row" style="justify-content:center;">${sugPills}</div></div>`;
+        const clearRetry = document.getElementById("clear-retry-btn");
+        if (clearRetry) {
+          clearRetry.addEventListener("click", () => {
+            categorySelect.value = "";
+            sourceSelect.value = "";
+            dateFromInput.value = "";
+            dateToInput.value = "";
+            runSearch({ triggerLive: false });
+          });
+        }
+        for (const p of resultsEl.querySelectorAll(".sug-pill")) {
+          p.addEventListener("click", () => triggerQuery(p.dataset.query || ""));
+        }
+        return;
+      }
+
+      resultsEl.innerHTML = data.results.map(item => {
+        const titleHtml = item.highlighted_title || escapeHtml(item.title);
+        const primaryPct = Math.round(Number(item.category_confidence) * 100);
+        const isBorderline = Boolean(
+          item.secondary_category
+          && item.secondary_confidence !== null
+          && item.secondary_confidence !== undefined
+          && Number(item.category_confidence) < 0.5
+        );
+        const catConf = isBorderline
+          ? `${escapeHtml(capitalizeLabel(item.predicted_category))} ${primaryPct}% / ${escapeHtml(capitalizeLabel(item.secondary_category))} ${Math.round(Number(item.secondary_confidence) * 100)}%`
+          : `${escapeHtml(capitalizeLabel(item.predicted_category))} · ${primaryPct}%`;
+        const catTitle = isBorderline
+          ? ` title="Borderline multi-topic prediction (top confidence below 50%)"`
+          : "";
+        const fieldChips = (item.field_matches || []).map(fm =>
+          `<span class="field-chip">${escapeHtml(fm.label)} (${Number(fm.weight).toFixed(1)}x: +${Number(fm.score).toFixed(2)})</span>`
+        ).join("");
+        const entChips = (item.entities || []).map(ent =>
+          `<button type="button" class="entity-chip entity-trigger" data-entity="${escapeHtml(ent.text)}">${escapeHtml(ent.label)}: ${escapeHtml(ent.text)}</button>`
+        ).join("");
+        const bgCount = (item.background_links || []).length;
+        const isFresh = freshSet.has(item.doc_id);
+        return `
+          <article class="card">
+            <div class="card-top">
+              <h2><a href="${escapeHtml(safeHttpUrl(item.canonical_url))}" target="_blank" rel="noopener noreferrer">${titleHtml}</a></h2>
+              <div class="score-group">
+                ${isFresh ? `<span class="new-pill">NEW · Crawled Just Now</span>` : ""}
+                <span class="cat-pill${isBorderline ? " borderline" : ""}"${catTitle}>${catConf}</span>
+                <span class="score-pill">${data.query.trim() ? `Score: ${Number(item.score).toFixed(2)}` : "Filter match"}</span>
+              </div>
+            </div>
+            <div class="meta">
+              ${escapeHtml(item.source || "Unknown Source")}
+              ${item.kicker ? " · Section: " + escapeHtml(item.kicker) : ""}
+              ${item.author ? " · By " + escapeHtml(item.author) : ""}
+              ${item.published_date ? " · " + escapeHtml(formatDateShort(item.published_date)) : ""}
+            </div>
+            <div class="field-breakdown">${fieldChips}</div>
+            <div class="snippet">${item.snippet}</div>
+            ${entChips ? `<div class="card-entities">${entChips}</div>` : ""}
+            <div class="card-actions">
+              <button type="button" class="btn-secondary read-modal-btn" data-doc-id="${escapeHtml(item.doc_id)}">Read Full Article</button>
+              <details class="bg-drawer">
+                <summary>Related / Background Stories (${bgCount})</summary>
+                ${renderBackgroundList(item.background_links)}
+              </details>
+            </div>
+          </article>`;
+      }).join("");
+
+      for (const trigger of document.querySelectorAll(".entity-trigger")) {
+        trigger.addEventListener("click", () => triggerQuery(trigger.dataset.entity || ""));
+      }
+      for (const btn of document.querySelectorAll(".read-modal-btn")) {
+        btn.addEventListener("click", () => openArticleModal(btn.dataset.docId || ""));
+      }
+    }
+
+    function startLiveRetrievalStream(params, forcePoll) {
+      closeLiveStream();
+      const liveParams = new URLSearchParams(params.toString());
+      if (forcePoll) liveParams.set("force_poll", "true");
+      setLiveProgress("working", "Checking registered news links for fresh articles...");
+
+      const es = new EventSource(`/api/search/live?${liveParams.toString()}`);
+      activeLiveStream = es;
+
+      es.onmessage = (event) => {
+        if (activeLiveStream !== es) return;
+        let payload;
+        try { payload = JSON.parse(event.data); } catch (_e) { return; }
+        if (payload.stage === "complete") {
+          closeLiveStream();
+          const sum = payload.crawl_summary || {};
+          const added = Number(sum.newly_indexed || 0);
+          const domains = (sum.crawled_domains || []).length;
+          const secs = ((Number(sum.elapsed_ms || 0)) / 1000).toFixed(1);
+          const summaryMsg = added > 0
+            ? `Live crawl complete in ${secs}s: added +${added} fresh article(s) from ${domains} outlet(s) (now ${sum.total_indexed} indexed).`
+            : `Checked registered news links in ${secs}s (${sum.matched_pending || 0} candidate(s) checked; index up to date with ${sum.total_indexed || ""} articles).`;
+          setLiveProgress("done", summaryMsg);
+          if (payload.search_response) {
+            renderSearchData(payload.search_response, sum.new_doc_ids || []);
+          }
+        } else if (payload.stage === "error") {
+          closeLiveStream();
+          setLiveProgress("err", payload.message || "Live crawl encountered an error.");
+        } else if (payload.message) {
+          setLiveProgress("working", payload.message);
+        }
+      };
+
+      es.onerror = () => {
+        if (activeLiveStream === es) {
+          closeLiveStream();
+        }
+      };
+    }
+
+    async function runSearch(options) {
+      const opts = options || {};
+      const qVal = qInput.value.trim();
+      if (!qVal && !hasActiveFilters()) {
+        clearToIdle();
+        return;
+      }
+      closeLiveStream();
+      if (!qVal || !liveCrawlToggle.checked) {
+        setLiveProgress(null, "");
+      }
+
+      const params = new URLSearchParams();
+      if (qVal) params.set("q", qVal);
+      if (sortSelect.value) params.set("sort", sortSelect.value);
+      for (const [key, el] of [
+        ["category", categorySelect],
+        ["source", sourceSelect],
+        ["date_from", dateFromInput],
+        ["date_to", dateToInput],
+      ]) {
+        const val = el.value.trim();
+        if (val) params.set(key, val);
+      }
+
+      statusEl.textContent = "Searching...";
+      let res;
+      let data = {};
+      try {
+        res = await fetch(`/api/search?${params.toString()}`);
+        try { data = await res.json(); } catch (_e) { data = {}; }
+      } catch (_err) {
+        statusEl.textContent = "Network error while contacting search API.";
+        resultsEl.innerHTML = "";
+        return;
+      }
+
+      if (!res.ok) {
+        statusEl.textContent = data.detail || `Search error (HTTP ${res.status})`;
+        resultsEl.innerHTML = "";
+        return;
+      }
+
+      renderSearchData(data, []);
+
+      const shouldLiveCrawl = Boolean(
+        qVal
+        && (opts.forcePoll || (liveCrawlToggle.checked && opts.triggerLive !== false))
+      );
+      if (shouldLiveCrawl) {
+        startLiveRetrievalStream(params, Boolean(opts.forcePoll));
+      }
+    }
+
+    form.addEventListener("submit", (e) => { e.preventDefault(); runSearch({ triggerLive: true }); });
+    forceLiveBtn.addEventListener("click", () => {
+      if (!qInput.value.trim()) { qInput.focus(); return; }
+      runSearch({ triggerLive: true, forcePoll: true });
+    });
+    for (const el of [categorySelect, sourceSelect, sortSelect, dateFromInput, dateToInput]) {
+      el.addEventListener("change", () => {
+        if (qInput.value.trim() || hasActiveFilters()) runSearch({ triggerLive: false });
+        else { renderOverviewSync(); clearToIdle(); }
+      });
+    }
+    debugToggle.addEventListener("change", () => renderDebugPanel(lastDebug));
+    resetBtn.addEventListener("click", () => {
+      categorySelect.value = "";
+      sourceSelect.value = "";
+      sortSelect.value = "relevance";
+      dateFromInput.value = "";
+      dateToInput.value = "";
+      renderOverviewSync();
+      if (qInput.value.trim()) runSearch();
+      else clearToIdle();
+    });
+    for (const preset of document.querySelectorAll(".date-preset")) {
+      preset.addEventListener("click", () => {
+        const days = Number(preset.dataset.days || 7);
+        const now = new Date();
+        const past = new Date(now.getTime() - days * 86400000);
+        dateToInput.value = now.toISOString().slice(0, 10);
+        dateFromInput.value = past.toISOString().slice(0, 10);
+        runSearch();
+      });
+    }
+
+    // TAB 2: Live ML Classifier & Retrieval Benchmark
+    async function loadClassifierMetrics() {
+      const subEl = document.getElementById("clf-subtitle");
+      const kpisEl = document.getElementById("clf-kpis");
+      const tblWrap = document.getElementById("clf-table-wrap");
+      try {
+        const res = await fetch("/api/classifier/metrics");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!data.trained) {
+          subEl.textContent = "ML classifier has not been trained yet. Run: python -m src.pipeline train-classifier";
+          kpisEl.innerHTML = "";
+          tblWrap.innerHTML = "";
+          return;
+        }
+        subEl.textContent = `${data.model_type} · ${data.cv_folds}-Fold Stratified CV across ${data.num_samples} labeled articles (${data.num_classes} classes) · Trained ${formatDateShort(data.trained_at_utc)}`;
+        kpisEl.innerHTML =
+          `<div class="kpi-card"><div class="kpi-label">CV Accuracy</div><div class="kpi-val">${(data.accuracy * 100).toFixed(1)}%</div><div class="kpi-sub">Text-only (no kicker cheat)</div></div>` +
+          `<div class="kpi-card"><div class="kpi-label">Macro F1</div><div class="kpi-val">${(data.macro_f1 * 100).toFixed(1)}%</div><div class="kpi-sub">Unweighted across classes</div></div>` +
+          `<div class="kpi-card"><div class="kpi-label">Weighted F1</div><div class="kpi-val">${(data.weighted_f1 * 100).toFixed(1)}%</div><div class="kpi-sub">Support-weighted</div></div>` +
+          `<div class="kpi-card"><div class="kpi-label">Training Samples</div><div class="kpi-val">${data.num_samples}</div><div class="kpi-sub">${data.num_classes} canonical categories</div></div>`;
+
+        const rows = (data.labels || []).map(lbl => {
+          const m = (data.per_class || {})[lbl] || {};
+          const feats = ((data.top_features || {})[lbl] || []).slice(0, 5).join(", ");
+          return `<tr>
+            <td><strong>${escapeHtml(capitalizeLabel(lbl))}</strong></td>
+            <td>${((m.precision || 0) * 100).toFixed(1)}%</td>
+            <td>${((m.recall || 0) * 100).toFixed(1)}%</td>
+            <td>${((m.f1 || 0) * 100).toFixed(1)}%</td>
+            <td>${m.support || 0}</td>
+            <td class="meta">${escapeHtml(feats)}</td>
+          </tr>`;
+        }).join("");
+        tblWrap.innerHTML = `<table class="data-table"><thead><tr><th>Category</th><th>Precision</th><th>Recall</th><th>F1</th><th>Support</th><th>Top Discriminative Terms</th></tr></thead><tbody>${rows}</tbody></table>`;
+      } catch (err) {
+        subEl.textContent = `Unable to load classifier metrics: ${err.message}`;
+      }
+    }
+
+    document.getElementById("run-eval-btn").addEventListener("click", async () => {
+      const tbody = document.getElementById("eval-table-body");
+      tbody.innerHTML = `<tr><td colspan="6" class="meta">Running live BM25 benchmark...</td></tr>`;
+      try {
+        const res = await fetch("/api/evaluate/default?k=10");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const report = await res.json();
+        document.getElementById("kpi-map").textContent = Number(report.mean_average_precision).toFixed(3);
+        document.getElementById("kpi-ndcg").textContent = Number(report.mean_ndcg_at_k).toFixed(3);
+        document.getElementById("kpi-mrr").textContent = Number(report.mean_reciprocal_rank).toFixed(3);
+        document.getElementById("kpi-p10").textContent = Number(report.mean_precision_at_k).toFixed(3);
+        document.getElementById("kpi-r10").textContent = Number(report.mean_recall_at_k).toFixed(3);
+        tbody.innerHTML = (report.per_query || []).map(q => `
+          <tr>
+            <td><strong>${escapeHtml(q.query)}</strong></td>
+            <td>${Number(q.precision_at_k).toFixed(3)}</td>
+            <td>${Number(q.recall_at_k).toFixed(3)}</td>
+            <td>${Number(q.average_precision).toFixed(3)}</td>
+            <td>${Number(q.ndcg_at_k).toFixed(3)}</td>
+            <td>${Number(q.reciprocal_rank).toFixed(3)}</td>
+          </tr>`).join("");
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="6" class="meta">Benchmark failed: ${escapeHtml(err.message)}</td></tr>`;
+      }
+    });
+
+    // TAB 3: Live Crawler & Corpus Health
+    async function loadCrawlerStats() {
+      const kpisEl = document.getElementById("crawler-kpis");
+      const wrapEl = document.getElementById("crawler-feeds-wrap");
+      kpisEl.innerHTML = `<div class="meta">Loading live SQLite telemetry...</div>`;
+      try {
+        const res = await fetch("/api/stats");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const f = data.frontier_counts || {};
+        kpisEl.innerHTML =
+          `<div class="kpi-card"><div class="kpi-label">Articles Stored</div><div class="kpi-val">${data.articles_count || 0}</div><div class="kpi-sub">Indexed: ${data.indexed_doc_count || 0}</div></div>` +
+          `<div class="kpi-card"><div class="kpi-label">Active RSS Feeds</div><div class="kpi-val">${data.active_feeds || 0}</div><div class="kpi-sub">Total registered: ${data.total_feeds || 0}</div></div>` +
+          `<div class="kpi-card"><div class="kpi-label">Frontier Pending</div><div class="kpi-val">${f.pending || 0}</div><div class="kpi-sub">Fetched: ${f.fetched || 0}</div></div>` +
+          `<div class="kpi-card"><div class="kpi-label">Skipped / Failed</div><div class="kpi-val">${(f.skipped || 0) + (f.failed || 0)}</div><div class="kpi-sub">Skip: ${f.skipped || 0} · Fail: ${f.failed || 0}</div></div>`;
+
+        const rows = (data.feeds || []).map(fd => `
+          <tr>
+            <td><strong>${escapeHtml(fd.name)}</strong></td>
+            <td>${escapeHtml(fd.source)}</td>
+            <td>${escapeHtml(fd.category)}</td>
+            <td>${fd.articles}</td>
+            <td>${fd.pending}</td>
+            <td>${fd.fetched}</td>
+            <td>${fd.failed}</td>
+          </tr>`).join("");
+        wrapEl.innerHTML = rows
+          ? `<table class="data-table"><thead><tr><th>Feed</th><th>Source</th><th>Section</th><th>Articles</th><th>Pending</th><th>Fetched</th><th>Failed</th></tr></thead><tbody>${rows}</tbody></table>`
+          : `<p class="meta">No SQLite feed database available for this index instance.</p>`;
+      } catch (err) {
+        kpisEl.innerHTML = `<div class="meta">Unable to load crawler stats: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+    document.getElementById("refresh-stats-btn").addEventListener("click", loadCrawlerStats);
+
+    // Initial load
+    (async () => {
+      try {
+        const res = await fetch("/api/corpus");
+        if (res.ok) renderOverview(await res.json());
+      } catch (_err) {
+        corpusStatsEl.textContent = "Corpus statistics unavailable.";
+      }
+    })();
+  </script>
+</body>
+</html>

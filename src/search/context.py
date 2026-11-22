@@ -3,13 +3,53 @@
 from __future__ import annotations
 
 import functools
+import math
 import re
 from collections import Counter
+from typing import Any
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 from src.indexer.bm25_index import BM25Index
 from src.indexer.preprocessing import ENGLISH_STOPWORDS, preprocess_text
 from src.indexer.schemas import IndexedDocument
 from src.search.schemas import BackgroundLink, EntityLabel, NamedEntity
+
+# News outlets, wire agencies, and photo agencies must never act as topical ORG entities or
+# glue unrelated articles together in background story linking.
+_PUBLISHER_AND_WIRE_ORGS: frozenset[str] = frozenset(
+    {
+        "bbc",
+        "bbc news",
+        "bbc sport",
+        "bbc sounds",
+        "reuters",
+        "associated press",
+        "ap",
+        "afp",
+        "pti",
+        "ani",
+        "getty images",
+        "shutterstock",
+        "alamy",
+        "the hindu",
+        "hindustan times",
+        "indian express",
+        "the indian express",
+        "times of india",
+        "the times of india",
+        "economic times",
+        "the economic times",
+        "india today",
+        "the guardian",
+        "al jazeera",
+        "new york times",
+        "the new york times",
+        "ndtv",
+        "npr",
+    }
+)
 
 _GPE_GAZETTEER: frozenset[str] = frozenset(
     {
@@ -40,15 +80,27 @@ _GPE_GAZETTEER: frozenset[str] = frozenset(
 _ACRONYM_ORGS: frozenset[str] = frozenset(
     {
         "UN", "WHO", "IMF", "NATO", "EU", "RBI", "SEBI", "ISRO", "NASA",
-        "BBC", "NDTV", "BCCI", "ICC",
+        "BCCI", "ICC", "SEC", "FTC", "DOJ", "FBI", "ECB", "WTO", "OPEC",
+        "NYSE", "OECD", "UNICEF", "UNESCO", "IAEA", "IBM", "AMD", "TSMC",
+        "ASML", "HSBC", "UBS", "HDFC", "ICICI", "SBI", "OCBC", "TCS",
+        "DRDO", "CBI", "NIA",
     }
 )
 
-# Capitalized single-word brand/company ORGs matched case-sensitively to avoid common-noun collisions.
+# Capitalized single-word brand/company ORGs matched case-sensitively to avoid common-noun/surname collisions.
 _PROPER_ORGS: frozenset[str] = frozenset(
     {
-        "Google", "Microsoft", "Apple", "Meta", "Amazon", "OpenAI", "Anthropic", "Reuters",
+        "Google", "Microsoft", "Apple", "Meta", "Amazon", "OpenAI", "Anthropic",
         "SpaceX", "Tesla", "Netflix", "Boeing", "Airbus", "Nvidia", "Oracle", "Samsung",
+        "Nasdaq", "JPMorgan", "Citigroup", "Barclays", "BlackRock", "Blackstone",
+        "Databricks", "Snowflake", "Palantir", "ByteDance", "TikTok", "Alibaba",
+        "Tencent", "Huawei", "Qualcomm", "Broadcom", "Intel", "Stripe", "Uber",
+        "Airbnb", "Spotify", "Shopify", "Salesforce", "Adobe", "Cisco", "Sony",
+        "Nintendo", "SoftBank", "Infosys", "Wipro", "Mastercard", "PayPal",
+        "Vanguard", "Deloitte", "McKinsey", "Accenture", "Cloudflare", "GitHub",
+        "Reddit", "LinkedIn", "DeepMind", "CoreWeave", "Waymo", "Flipkart",
+        "Zomato", "Swiggy", "Paytm", "Razorpay", "PhonePe", "YouTube",
+        "Instagram", "WhatsApp",
     }
 )
 
@@ -60,16 +112,6 @@ _MULTIWORD_ORGS: dict[str, str] = {
     "world bank": "World Bank",
     "european union": "European Union",
     "reserve bank of india": "Reserve Bank of India",
-    "bbc news": "BBC News",
-    "the hindu": "The Hindu",
-    "indian express": "Indian Express",
-    "hindustan times": "Hindustan Times",
-    "times of india": "Times of India",
-    "economic times": "Economic Times",
-    "india today": "India Today",
-    "the guardian": "The Guardian",
-    "al jazeera": "Al Jazeera",
-    "new york times": "New York Times",
     "supreme court": "Supreme Court",
     "election commission": "Election Commission",
     "blue origin": "Blue Origin",
@@ -78,7 +120,6 @@ _MULTIWORD_ORGS: dict[str, str] = {
     "white house": "White House",
     "rajya sabha": "Rajya Sabha",
     "lok sabha": "Lok Sabha",
-    "getty images": "Getty Images",
     "homeland security": "Homeland Security",
     "microsoft outlook": "Microsoft Outlook",
     "microsoft teams": "Microsoft Teams",
@@ -89,6 +130,70 @@ _MULTIWORD_ORGS: dict[str, str] = {
     "phoenix publishing house": "Phoenix Publishing House",
     "lloyd law college": "Lloyd Law College",
     "rajaratnam school": "Rajaratnam School",
+    # Well-known financial, investment & consulting institutions
+    "morgan stanley": "Morgan Stanley",
+    "goldman sachs": "Goldman Sachs",
+    "jpmorgan chase": "JPMorgan Chase",
+    "jp morgan": "JPMorgan",
+    "bank of america": "Bank of America",
+    "wells fargo": "Wells Fargo",
+    "charles schwab": "Charles Schwab",
+    "berkshire hathaway": "Berkshire Hathaway",
+    "standard chartered": "Standard Chartered",
+    "deutsche bank": "Deutsche Bank",
+    "credit suisse": "Credit Suisse",
+    "state bank of india": "State Bank of India",
+    "hdfc bank": "HDFC Bank",
+    "icici bank": "ICICI Bank",
+    "axis bank": "Axis Bank",
+    "kotak mahindra": "Kotak Mahindra",
+    "capital economics": "Capital Economics",
+    "s&p global": "S&P Global",
+    "sequoia capital": "Sequoia Capital",
+    "andreessen horowitz": "Andreessen Horowitz",
+    "sound ventures": "Sound Ventures",
+    "y combinator": "Y Combinator",
+    "silver lake": "Silver Lake",
+    "tiger global": "Tiger Global",
+    "apollo global": "Apollo Global",
+    # Tech, AI & industrial corporations
+    "hugging face": "Hugging Face",
+    "google deepmind": "Google DeepMind",
+    "mistral ai": "Mistral AI",
+    "scale ai": "Scale AI",
+    "perplexity ai": "Perplexity AI",
+    "stability ai": "Stability AI",
+    "meta platforms": "Meta Platforms",
+    "tata consultancy services": "Tata Consultancy Services",
+    "tata sons": "Tata Sons",
+    "tata motors": "Tata Motors",
+    "reliance industries": "Reliance Industries",
+    "adani group": "Adani Group",
+    "bharti airtel": "Bharti Airtel",
+    "general motors": "General Motors",
+    "general electric": "General Electric",
+    "lockheed martin": "Lockheed Martin",
+    "northrop grumman": "Northrop Grumman",
+    "hewlett packard": "Hewlett Packard",
+    "texas instruments": "Texas Instruments",
+    # Philanthropic foundations, research labs & NGOs
+    "coefficient giving": "Coefficient Giving",
+    "open philanthropy": "Open Philanthropy",
+    "bill & melinda gates foundation": "Gates Foundation",
+    "gates foundation": "Gates Foundation",
+    "ford foundation": "Ford Foundation",
+    "rockefeller foundation": "Rockefeller Foundation",
+    "chan zuckerberg initiative": "Chan Zuckerberg Initiative",
+    "bloomberg philanthropies": "Bloomberg Philanthropies",
+    "macarthur foundation": "MacArthur Foundation",
+    "carnegie endowment": "Carnegie Endowment",
+    "brookings institution": "Brookings Institution",
+    "rand corporation": "RAND Corporation",
+    "world economic forum": "World Economic Forum",
+    "amnesty international": "Amnesty International",
+    "human rights watch": "Human Rights Watch",
+    "red cross": "Red Cross",
+    "doctors without borders": "Doctors Without Borders",
 }
 
 _ORG_SUFFIXES: frozenset[str] = frozenset(
@@ -103,7 +208,10 @@ _ORG_SUFFIXES: frozenset[str] = frozenset(
         "games", "mail", "sabha", "sangh", "kazhagam", "pathippagam",
         "ventures", "partners", "holdings", "industries", "telecom",
         "publications", "publishing", "networks", "network", "hospital",
-        "museum", "embassy", "academy",
+        "museum", "embassy", "academy", "giving", "philanthropy",
+        "philanthropies", "capital", "securities", "labs", "economics",
+        "trust", "fund", "funds", "exchange", "initiative", "endowment",
+        "institution",
     }
 )
 
@@ -188,7 +296,7 @@ _NON_PERSON_WORDS: frozenset[str] = (
 
 _BOILERPLATE_LINE_RE = re.compile(
     r"^(?:read\s+more|also\s+read|follow\s+us|subscribe|sign\s+up|advertisement|"
-    r"published\s*:|updated\s*:|edited\s+by|reported\s+by|photo\s+credit|getty\s+images|"
+    r"published\s*[-–—:]|updated\s*[-–—:]|edited\s+by|reported\s+by|photo\s+credit|getty\s+images|"
     r"image\s+caption|all\s+rights\s+reserved|copyright|https?://|pti\b|ani\b|afp\b)",
     re.IGNORECASE,
 )
@@ -259,6 +367,13 @@ _NON_PERSON_WORDS = _NON_PERSON_WORDS | frozenset(
         "street", "road", "avenue", "square", "park", "bridge", "tower",
         "palace", "temple", "mosque", "church", "shrine", "monument",
         "inside", "author", "whitening", "cream",
+        "giving", "coefficient", "philanthropy", "philanthropies", "philanthropic",
+        "hugging", "face", "stanley", "sachs", "schwab", "external", "affairs",
+        "nifty", "track", "sensex", "nasdaq", "sons", "sir", "dame", "lord",
+        "lady", "shri", "smt", "mr", "mrs", "ms", "dr", "capital", "economics",
+        "ventures", "securities", "holdings", "partners", "labs", "initiative",
+        "endowment", "institution", "exchange", "ticker", "updated", "ist",
+        "gmt", "utc", "est", "pst", "pbc",
     }
 )
 
@@ -276,7 +391,9 @@ _EXTRA_ORG_SUFFIX_ALTERNATION = "|".join(
             "Games", "Mail", "Sabha", "Sangh", "Kazhagam", "Pathippagam",
             "Ventures", "Partners", "Holdings", "Industries", "Telecom",
             "Publications", "Publishing", "Networks", "Network", "Hospital",
-            "Museum", "Embassy", "Academy",
+            "Museum", "Embassy", "Academy", "Giving", "Philanthropy",
+            "Philanthropies", "Capital", "Securities", "Labs", "Economics",
+            "Initiative", "Endowment", "Institution",
         },
         key=len,
         reverse=True,
@@ -332,8 +449,8 @@ _BYLINE_LINE_RE = re.compile(
 )
 
 
-def _clean_body_for_ner(text: str) -> str:
-    """Strip boilerplate lines, ALL-CAPS banners, and Title-Cased headline lines before NER."""
+def _clean_body_for_ner(text: str, *, strip_bylines: bool = False) -> str:
+    """Strip boilerplate lines, ALL-CAPS banners, optional bylines, and Title-Cased headings before NER."""
     if not text or not text.strip():
         return ""
 
@@ -343,6 +460,8 @@ def _clean_body_for_ner(text: str) -> str:
         if not line:
             continue
         if _BOILERPLATE_LINE_RE.match(line):
+            continue
+        if strip_bylines and _BYLINE_LINE_RE.match(line):
             continue
 
         alpha_words = re.findall(r"[A-Za-z]+", line)
@@ -435,34 +554,73 @@ def _has_person_context(line: str, raw_start: int, cand_end: int) -> bool:
     return False
 
 
+def _build_excluded_author_names(exclude_authors: str | None) -> frozenset[str]:
+    if not exclude_authors or not exclude_authors.strip():
+        return frozenset()
+    excluded: set[str] = set()
+    stripped = _AUTHOR_SUFFIX_RE.sub("", exclude_authors)
+    for part in _AUTHOR_SPLIT_RE.split(stripped):
+        cleaned = re.sub(r"\s+", " ", part).strip(" .,;:()[]{}\"'")
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        excluded.add(lowered)
+        nodots = re.sub(r"\s+", " ", lowered.replace(".", " ")).strip()
+        if nodots:
+            excluded.add(nodots)
+    for person in _extract_author_people(exclude_authors):
+        excluded.add(person.lower())
+    return frozenset(excluded)
+
+
 def _record_entity(
     counts: Counter[tuple[str, EntityLabel]],
     seen_spans: set[str],
     text: str,
     label: EntityLabel,
+    *,
+    excluded_authors: frozenset[str] = frozenset(),
 ) -> None:
     cleaned = re.sub(r"\s+", " ", text).strip(" .,;:()[]{}\"'")
     if not cleaned:
         return
+    lowered = cleaned.lower()
+    if lowered in _PUBLISHER_AND_WIRE_ORGS:
+        seen_spans.add(lowered)
+        return
+    if label == EntityLabel.PERSON and excluded_authors:
+        nodots = re.sub(r"\s+", " ", lowered.replace(".", " ")).strip()
+        if lowered in excluded_authors or nodots in excluded_authors:
+            seen_spans.add(lowered)
+            return
     counts[(cleaned, label)] += 1
-    seen_spans.add(cleaned.lower())
+    seen_spans.add(lowered)
 
 
 @functools.lru_cache(maxsize=4096)
 def _extract_entities_cached(
     text: str,
     author: str | None,
+    exclude_authors: str | None,
+    strip_bylines: bool,
     max_entities: int,
 ) -> tuple[NamedEntity, ...]:
     counts: Counter[tuple[str, EntityLabel]] = Counter()
     seen_spans: set[str] = set()
     trusted_persons: set[str] = set()
+    excluded_author_set = _build_excluded_author_names(exclude_authors)
 
     for person_name in _extract_author_people(author):
-        _record_entity(counts, seen_spans, person_name, EntityLabel.PERSON)
+        _record_entity(
+            counts,
+            seen_spans,
+            person_name,
+            EntityLabel.PERSON,
+            excluded_authors=excluded_author_set,
+        )
         trusted_persons.add(person_name.lower())
 
-    clean_text = _clean_body_for_ner(text)
+    clean_text = _clean_body_for_ner(text, strip_bylines=strip_bylines)
     if not clean_text.strip():
         return tuple(
             NamedEntity(text=name, label=label, count=cnt)
@@ -482,26 +640,30 @@ def _extract_entities_cached(
                 _record_entity(counts, seen_spans, match.group(0), EntityLabel.EVENT)
                 occupied.append((match.start(), match.end()))
 
-        # 2. Organizations by suffix, multi-word curated names, and strict ALL-CAPS acronyms
+        # 2. Organizations: curated multi-word gazetteer first, then suffix phrases, brands, and acronyms
+        for match in _MULTIWORD_ORGS_RE.finditer(lower_line):
+            if _overlaps_occupied(occupied, match.start(), match.end()):
+                continue
+            canonical = _MULTIWORD_ORGS.get(match.group(0).lower())
+            if canonical:
+                _record_entity(counts, seen_spans, canonical, EntityLabel.ORG)
+                occupied.append((match.start(), match.end()))
+
         for regex in (_ORG_PHRASE_SL_RE, _EXTRA_ORG_PHRASE_RE):
             for match in regex.finditer(line):
                 if not _overlaps_occupied(occupied, match.start(), match.end()):
                     _record_entity(counts, seen_spans, match.group(0), EntityLabel.ORG)
                     occupied.append((match.start(), match.end()))
 
-        for match in _MULTIWORD_ORGS_RE.finditer(lower_line):
-            canonical = _MULTIWORD_ORGS.get(match.group(0).lower())
-            if canonical:
-                _record_entity(counts, seen_spans, canonical, EntityLabel.ORG)
+        for match in _PROPER_ORGS_RE.finditer(line):
+            if not _overlaps_occupied(occupied, match.start(), match.end()):
+                _record_entity(counts, seen_spans, match.group(0), EntityLabel.ORG)
                 occupied.append((match.start(), match.end()))
 
-        for match in _PROPER_ORGS_RE.finditer(line):
-            _record_entity(counts, seen_spans, match.group(0), EntityLabel.ORG)
-            occupied.append((match.start(), match.end()))
-
         for match in _ACRONYM_ORGS_RE.finditer(line):
-            _record_entity(counts, seen_spans, match.group(0), EntityLabel.ORG)
-            occupied.append((match.start(), match.end()))
+            if not _overlaps_occupied(occupied, match.start(), match.end()):
+                _record_entity(counts, seen_spans, match.group(0), EntityLabel.ORG)
+                occupied.append((match.start(), match.end()))
 
         # 3. Geo-political entities (GPE) and geographic features
         for match in _GEO_FEATURE_RE.finditer(line):
@@ -510,8 +672,9 @@ def _extract_entities_cached(
                 occupied.append((match.start(), match.end()))
 
         for match in _GPE_SHORT_RE.finditer(line):
-            _record_entity(counts, seen_spans, match.group(0).upper(), EntityLabel.GPE)
-            occupied.append((match.start(), match.end()))
+            if not _overlaps_occupied(occupied, match.start(), match.end()):
+                _record_entity(counts, seen_spans, match.group(0).upper(), EntityLabel.GPE)
+                occupied.append((match.start(), match.end()))
 
         for match in _GPE_LONG_RE.finditer(lower_line):
             if not _overlaps_occupied(occupied, match.start(), match.end()):
@@ -528,7 +691,13 @@ def _extract_entities_cached(
             lower_cand = cleaned_person.lower()
             trusted_persons.add(lower_cand)
             if lower_cand not in seen_spans:
-                _record_entity(counts, seen_spans, cleaned_person, EntityLabel.PERSON)
+                _record_entity(
+                    counts,
+                    seen_spans,
+                    cleaned_person,
+                    EntityLabel.PERSON,
+                    excluded_authors=excluded_author_set,
+                )
                 occupied.append((match.start(1), match.end(1)))
 
     # 4b. Context-verified capitalized person names across clean body lines
@@ -551,7 +720,13 @@ def _extract_entities_cached(
                 line, match.start(1), match.end(1)
             ):
                 continue
-            _record_entity(counts, seen_spans, cleaned_person, EntityLabel.PERSON)
+            _record_entity(
+                counts,
+                seen_spans,
+                cleaned_person,
+                EntityLabel.PERSON,
+                excluded_authors=excluded_author_set,
+            )
             occupied.append((match.start(1), match.end(1)))
 
     ranked = sorted(
@@ -568,10 +743,20 @@ def extract_entities(
     text: str,
     *,
     author: str | None = None,
+    exclude_authors: str | None = None,
+    strip_bylines: bool = False,
     max_entities: int = 15,
 ) -> list[NamedEntity]:
     """Extract PERSON, ORG, GPE, and EVENT entities from clean article body text."""
-    return list(_extract_entities_cached(text or "", author, max_entities))
+    return list(
+        _extract_entities_cached(
+            text or "",
+            author,
+            exclude_authors,
+            strip_bylines,
+            max_entities,
+        )
+    )
 
 
 def aggregate_entities(
@@ -594,6 +779,47 @@ def aggregate_entities(
     ]
 
 
+def build_background_link_artifacts(
+    docs: list[IndexedDocument],
+    entities_by_doc: dict[str, list[NamedEntity]],
+) -> tuple[Any, dict[str, int], dict[str, float]]:
+    """Precompute sparse TF-IDF cosine matrix and entity IDF weights for fast topical linking."""
+    if len(docs) < 2:
+        return None, {}, {}
+
+    doc_id_to_row = {doc.doc_id: idx for idx, doc in enumerate(docs)}
+    texts = [f"{doc.title} {doc.title} {doc.body_text[:2500]}" for doc in docs]
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),
+        sublinear_tf=True,
+        min_df=1,
+        max_df=0.85,
+        max_features=20000,
+        stop_words="english",
+    )
+    try:
+        tfidf_matrix = vectorizer.fit_transform(texts)
+    except ValueError:
+        tfidf_matrix = None
+
+    entity_df: Counter[str] = Counter()
+    n_docs = len(docs)
+    for ents in entities_by_doc.values():
+        seen_in_doc = {
+            e.text.lower()
+            for e in ents
+            if e.text.lower() not in _PUBLISHER_AND_WIRE_ORGS
+        }
+        for key in seen_in_doc:
+            entity_df[key] += 1
+
+    entity_idf = {
+        key: math.log((n_docs + 1.0) / (df + 1.0)) + 1.0
+        for key, df in entity_df.items()
+    }
+    return tfidf_matrix, doc_id_to_row, entity_idf
+
+
 def suggest_background_links(
     index: BM25Index,
     anchor_doc: IndexedDocument,
@@ -601,20 +827,117 @@ def suggest_background_links(
     limit: int = 3,
     entities_by_doc: dict[str, list[NamedEntity]] | None = None,
     token_sets_by_doc: dict[str, set[str]] | None = None,
+    docs_ordered: list[IndexedDocument] | None = None,
+    tfidf_matrix: Any = None,
+    doc_id_to_row: dict[str, int] | None = None,
+    entity_idf: dict[str, float] | None = None,
 ) -> list[BackgroundLink]:
-    """Suggest related background stories grounded in shared clean-body entities and topical overlap."""
+    """Suggest related background stories via TF-IDF cosine similarity and IDF-weighted entity overlap."""
     if limit <= 0 or index.doc_count <= 1:
         return []
 
-    anchor_entities = (
-        entities_by_doc[anchor_doc.doc_id][:12]
-        if entities_by_doc is not None and anchor_doc.doc_id in entities_by_doc
-        else extract_entities(anchor_doc.body_text, author=None, max_entities=12)
-    )
+    anchor_entities = [
+        e
+        for e in (
+            entities_by_doc[anchor_doc.doc_id][:12]
+            if entities_by_doc is not None and anchor_doc.doc_id in entities_by_doc
+            else extract_entities(anchor_doc.body_text, author=None, max_entities=12)
+        )
+        if e.text.lower() not in _PUBLISHER_AND_WIRE_ORGS
+    ]
     anchor_entity_set = {e.text.lower() for e in anchor_entities}
     anchor_specific_entities = {
         e.text.lower() for e in anchor_entities if e.label != EntityLabel.GPE
     }
+
+    # Fast high-precision path using precomputed sparse TF-IDF cosine + entity IDF weights
+    if (
+        tfidf_matrix is not None
+        and doc_id_to_row is not None
+        and docs_ordered is not None
+        and anchor_doc.doc_id in doc_id_to_row
+    ):
+        row_idx = doc_id_to_row[anchor_doc.doc_id]
+        cos_scores = cosine_similarity(tfidf_matrix[row_idx], tfidf_matrix).ravel()
+        anchor_cat = anchor_doc.predicted_category or (
+            anchor_doc.kicker.lower() if anchor_doc.kicker else None
+        )
+        scored_fast: list[tuple[float, list[str], IndexedDocument]] = []
+
+        for idx, cand_doc in enumerate(docs_ordered):
+            if (
+                cand_doc.doc_id == anchor_doc.doc_id
+                or cand_doc.canonical_url == anchor_doc.canonical_url
+            ):
+                continue
+            cos_sim = float(cos_scores[idx])
+            if cos_sim < 0.055:
+                continue
+
+            cand_entities = [
+                e
+                for e in (
+                    entities_by_doc[cand_doc.doc_id][:12]
+                    if entities_by_doc is not None and cand_doc.doc_id in entities_by_doc
+                    else extract_entities(cand_doc.body_text, author=None, max_entities=12)
+                )
+                if e.text.lower() not in _PUBLISHER_AND_WIRE_ORGS
+            ]
+            cand_entity_map = {e.text.lower(): e.text for e in cand_entities}
+            cand_specific = {
+                e.text.lower() for e in cand_entities if e.label != EntityLabel.GPE
+            }
+            shared_keys = anchor_entity_set & set(cand_entity_map.keys())
+            shared_specific = anchor_specific_entities & cand_specific
+            shared_names = sorted(cand_entity_map[k] for k in shared_keys)
+
+            # Reject unrelated documents that lack both textual similarity and specific shared entities
+            if cos_sim < 0.11 and not shared_specific:
+                continue
+            if cos_sim < 0.075 and len(shared_keys) < 2:
+                continue
+
+            union_keys = anchor_entity_set | set(cand_entity_map.keys())
+            if union_keys and entity_idf:
+                shared_w = sum(entity_idf.get(k, 1.0) for k in shared_keys)
+                union_w = sum(entity_idf.get(k, 1.0) for k in union_keys)
+                entity_sim = (shared_w / union_w) if union_w > 0 else 0.0
+            else:
+                entity_sim = (len(shared_keys) / len(union_keys)) if union_keys else 0.0
+
+            cand_cat = cand_doc.predicted_category or (
+                cand_doc.kicker.lower() if cand_doc.kicker else None
+            )
+            cat_bonus = 0.06 if (anchor_cat and cand_cat and anchor_cat == cand_cat) else 0.0
+            earlier_bonus = (
+                0.04
+                if (
+                    anchor_doc.published_date
+                    and cand_doc.published_date
+                    and cand_doc.published_date <= anchor_doc.published_date
+                )
+                else 0.0
+            )
+            combined = round(
+                min(1.0, 0.60 * min(1.0, cos_sim * 2.2) + 0.30 * entity_sim + cat_bonus + earlier_bonus),
+                6,
+            )
+            scored_fast.append((combined, shared_names, cand_doc))
+
+        scored_fast.sort(key=lambda entry: (-entry[0], -len(entry[1]), entry[2].doc_id))
+        return [
+            BackgroundLink(
+                doc_id=cand_doc.doc_id,
+                title=cand_doc.title,
+                source=cand_doc.source,
+                kicker=cand_doc.kicker,
+                published_date=cand_doc.published_date,
+                canonical_url=cand_doc.canonical_url,
+                similarity_score=combined,
+                shared_entities=shared_names,
+            )
+            for combined, shared_names, cand_doc in scored_fast[:limit]
+        ]
 
     body_tokens = preprocess_text(anchor_doc.body_text)[:25]
     entity_terms = [e.text for e in anchor_entities[:8]]
@@ -657,11 +980,15 @@ def suggest_background_links(
             len(anchor_token_set & cand_token_set) / token_union if token_union > 0 else 0.0
         )
 
-        cand_entities = (
-            entities_by_doc[hit.doc_id][:12]
-            if entities_by_doc is not None and hit.doc_id in entities_by_doc
-            else extract_entities(hit.body_text, author=None, max_entities=12)
-        )
+        cand_entities = [
+            e
+            for e in (
+                entities_by_doc[hit.doc_id][:12]
+                if entities_by_doc is not None and hit.doc_id in entities_by_doc
+                else extract_entities(hit.body_text, author=None, max_entities=12)
+            )
+            if e.text.lower() not in _PUBLISHER_AND_WIRE_ORGS
+        ]
         cand_entity_map = {e.text.lower(): e.text for e in cand_entities}
         cand_specific = {
             e.text.lower() for e in cand_entities if e.label != EntityLabel.GPE

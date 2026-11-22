@@ -38,7 +38,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         retry_count      INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
         next_attempt_at  TEXT,
         last_http_status INTEGER,
-        discovered_at    TEXT NOT NULL
+        discovered_at    TEXT NOT NULL,
+        rss_title        TEXT,
+        rss_summary      TEXT,
+        rss_published_at TEXT
     );
     """,
     """
@@ -208,14 +211,17 @@ def get_connection(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def _ensure_frontier_guid_column(conn: sqlite3.Connection) -> None:
-    """Add optional guid column to pre-existing crawl_frontier tables without data loss."""
+def _ensure_frontier_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently add newer optional columns to pre-existing crawl_frontier tables."""
     columns = {
         row["name"]
         for row in conn.execute("PRAGMA table_info(crawl_frontier);").fetchall()
     }
-    if columns and "guid" not in columns:
-        conn.execute("ALTER TABLE crawl_frontier ADD COLUMN guid TEXT;")
+    if not columns:
+        return
+    for col_name in ("guid", "rss_title", "rss_summary", "rss_published_at"):
+        if col_name not in columns:
+            conn.execute(f"ALTER TABLE crawl_frontier ADD COLUMN {col_name} TEXT;")
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
@@ -223,7 +229,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
     with conn:
         for statement in SCHEMA_STATEMENTS[:2]:
             conn.execute(statement)
-        _ensure_frontier_guid_column(conn)
+        _ensure_frontier_columns(conn)
         for statement in SCHEMA_STATEMENTS[2:]:
             conn.execute(statement)
 
@@ -296,28 +302,154 @@ ADDITIONAL_BBC_FEEDS: tuple[Feed, ...] = (
 )
 
 
+BALANCED_EXTRA_FEEDS: tuple[Feed, ...] = (
+    Feed(
+        name="BBC News - Politics",
+        source="BBC News",
+        category="politics",
+        url="https://feeds.bbci.co.uk/news/politics/rss.xml",
+    ),
+    Feed(
+        name="The Guardian - Business",
+        source="The Guardian",
+        category="business",
+        url="https://www.theguardian.com/uk/business/rss",
+    ),
+    Feed(
+        name="The Guardian - Technology",
+        source="The Guardian",
+        category="technology",
+        url="https://www.theguardian.com/uk/technology/rss",
+    ),
+    Feed(
+        name="The Guardian - Sport",
+        source="The Guardian",
+        category="sport",
+        url="https://www.theguardian.com/uk/sport/rss",
+    ),
+    Feed(
+        name="The Guardian - Science",
+        source="The Guardian",
+        category="science",
+        url="https://www.theguardian.com/science/rss",
+    ),
+    Feed(
+        name="The Guardian - Culture",
+        source="The Guardian",
+        category="entertainment",
+        url="https://www.theguardian.com/uk/culture/rss",
+    ),
+    Feed(
+        name="The Guardian - Politics",
+        source="The Guardian",
+        category="politics",
+        url="https://www.theguardian.com/politics/rss",
+    ),
+    Feed(
+        name="The Hindu - Sci-Tech",
+        source="The Hindu",
+        category="science",
+        url="https://www.thehindu.com/sci-tech/feeder/default.rss",
+    ),
+    Feed(
+        name="The Hindu - International",
+        source="The Hindu",
+        category="world",
+        url="https://www.thehindu.com/news/international/feeder/default.rss",
+    ),
+    Feed(
+        name="The Hindu - Entertainment",
+        source="The Hindu",
+        category="entertainment",
+        url="https://www.thehindu.com/entertainment/feeder/default.rss",
+    ),
+    Feed(
+        name="The Indian Express - Sports",
+        source="The Indian Express",
+        category="sport",
+        url="https://indianexpress.com/section/sports/feed/",
+    ),
+    Feed(
+        name="The Indian Express - Technology",
+        source="The Indian Express",
+        category="technology",
+        url="https://indianexpress.com/section/technology/feed/",
+    ),
+    Feed(
+        name="The Indian Express - Business",
+        source="The Indian Express",
+        category="business",
+        url="https://indianexpress.com/section/business/feed/",
+    ),
+    Feed(
+        name="The Indian Express - Entertainment",
+        source="The Indian Express",
+        category="entertainment",
+        url="https://indianexpress.com/section/entertainment/feed/",
+    ),
+    Feed(
+        name="NPR - News",
+        source="NPR",
+        category="world",
+        url="https://feeds.npr.org/1001/rss.xml",
+    ),
+    Feed(
+        name="NPR - Business",
+        source="NPR",
+        category="business",
+        url="https://feeds.npr.org/1006/rss.xml",
+    ),
+    Feed(
+        name="NPR - Technology",
+        source="NPR",
+        category="technology",
+        url="https://feeds.npr.org/1019/rss.xml",
+    ),
+    Feed(
+        name="NPR - Science",
+        source="NPR",
+        category="science",
+        url="https://feeds.npr.org/1007/rss.xml",
+    ),
+    Feed(
+        name="NPR - Health",
+        source="NPR",
+        category="health",
+        url="https://feeds.npr.org/1128/rss.xml",
+    ),
+    Feed(
+        name="NPR - Politics",
+        source="NPR",
+        category="politics",
+        url="https://feeds.npr.org/1014/rss.xml",
+    ),
+)
+
+
 def seed_additional_bbc_feeds(conn: sqlite3.Connection) -> int:
     """Idempotently seed additional BBC News section feeds without altering default 15 feeds."""
-    before = conn.total_changes
-    with conn:
-        for feed in ADDITIONAL_BBC_FEEDS:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO rss_feeds (name, source, category, url, is_active)
-                VALUES (?, ?, ?, ?, ?);
-                """,
-                (feed.name, feed.source, feed.category, feed.url, int(feed.is_active)),
-            )
-    return conn.total_changes - before
+    return seed_feeds(conn, ADDITIONAL_BBC_FEEDS)
 
 
-def init_db(db_path: Path | str = DEFAULT_DB_PATH, *, expand_bbc: bool = False) -> Path:
+def seed_balanced_feeds(conn: sqlite3.Connection) -> int:
+    """Idempotently seed all balanced multi-outlet section feeds across 8 categories."""
+    return seed_feeds(conn, ADDITIONAL_BBC_FEEDS + BALANCED_EXTRA_FEEDS)
+
+
+def init_db(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    *,
+    expand_bbc: bool = False,
+    expand_feeds: bool = False,
+) -> Path:
     """Initialize SQLite storage and seed the 15 RSS feeds idempotently."""
     conn = get_connection(db_path)
     try:
         create_schema(conn)
         seed_feeds(conn)
-        if expand_bbc:
+        if expand_feeds:
+            seed_balanced_feeds(conn)
+        elif expand_bbc:
             seed_additional_bbc_feeds(conn)
     finally:
         conn.close()

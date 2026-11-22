@@ -18,6 +18,7 @@ from src.indexer.preprocessing import (
     ENGLISH_STOPWORDS,
     preprocess_query_for_field,
     preprocess_text,
+    stem_token,
     tokenize_article_fields,
 )
 from src.indexer.schemas import (
@@ -30,11 +31,42 @@ from src.indexer.schemas import (
     IndexSyncResult,
     SearchHit,
 )
-from src.models.schemas import Article, normalize_category, to_iso8601_utc, utc_now
+from src.models.schemas import (
+    Article,
+    map_to_canonical_category,
+    normalize_category,
+    to_iso8601_utc,
+    utc_now,
+)
 
 _MANIFEST_FILE = "manifest.json"
 _DOCUMENTS_FILE = "documents.json"
 _POSTINGS_FILE = "postings.json"
+_QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"')
+_RAW_WORD_RE = re.compile(r"[a-z]{3,}")
+
+
+def _edit_distance_le2(a: str, b: str) -> int:
+    """Compute Levenshtein edit distance, short-circuiting early when > 2."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 2:
+        return 3
+    if a == b:
+        return 0
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i] + [0] * lb
+        row_min = i
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            val = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+            curr[j] = val
+            if val < row_min:
+                row_min = val
+        if row_min > 2:
+            return 3
+        prev = curr
+    return prev[lb]
 
 
 @functools.lru_cache(maxsize=4096)
@@ -87,6 +119,8 @@ class BM25Index:
             field: 0 for field in IndexField
         }
         self._manifest_sig: tuple[int, int] | None = None
+        self._raw_vocab_df: Counter[str] | None = None
+        self._raw_vocab_buckets: dict[tuple[str, int], list[tuple[str, int]]] | None = None
         self._load_if_exists()
 
     @property
@@ -141,6 +175,8 @@ class BM25Index:
             }
         st = manifest_path.stat()
         self._manifest_sig = (st.st_mtime_ns, st.st_size)
+        self._raw_vocab_df = None
+        self._raw_vocab_buckets = None
 
     def refresh_if_changed(self) -> bool:
         """Reload index files from disk if manifest.json was modified externally."""
@@ -192,6 +228,9 @@ class BM25Index:
         articles: Sequence[Article],
         *,
         source_by_feed_id: Mapping[int, str] | None = None,
+        predicted_categories: (
+            Mapping[str, tuple[str, float] | tuple[str, float, str | None, float | None]] | None
+        ) = None,
     ) -> int:
         """Incrementally index unseen articles without dropping or clearing existing records."""
         newly_indexed = 0
@@ -221,6 +260,17 @@ class BM25Index:
                 if source_by_feed_id is not None
                 else None
             )
+            pred_cat: str | None = None
+            pred_conf: float | None = None
+            sec_cat: str | None = None
+            sec_conf: float | None = None
+            if predicted_categories and article.doc_id in predicted_categories:
+                pred_tuple = predicted_categories[article.doc_id]
+                if len(pred_tuple) == 4:
+                    pred_cat, pred_conf, sec_cat, sec_conf = pred_tuple
+                else:
+                    pred_cat, pred_conf = pred_tuple
+
             self._documents[article.doc_id] = IndexedDocument(
                 doc_id=article.doc_id,
                 feed_id=article.feed_id,
@@ -232,16 +282,28 @@ class BM25Index:
                 source=source,
                 published_date=article.published_date,
                 body_text=article.body_text,
+                predicted_category=pred_cat,
+                category_confidence=pred_conf,
+                secondary_category=sec_cat,
+                secondary_confidence=sec_conf,
                 field_lengths=field_lengths,
             )
             newly_indexed += 1
 
+        if newly_indexed > 0:
+            self._raw_vocab_df = None
+            self._raw_vocab_buckets = None
         if newly_indexed > 0 or not (self._index_dir / _MANIFEST_FILE).is_file():
             self._save()
 
         return newly_indexed
 
-    def sync_from_db(self, conn: sqlite3.Connection) -> IndexSyncResult:
+    def sync_from_db(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        apply_ml_classifier: bool = True,
+    ) -> IndexSyncResult:
         """Read unindexed articles from SQLite and add them incrementally to the search index."""
         rows = conn.execute(
             """
@@ -277,9 +339,26 @@ class BM25Index:
                 )
             )
 
+        predicted_map: (
+            dict[str, tuple[str, float, str | None, float | None]] | None
+        ) = None
+        if apply_ml_classifier and pending_articles:
+            from src.search.classifier import filter_borderline_secondary, get_cached_classifier
+
+            ml_clf = get_cached_classifier()
+            if ml_clf is not None:
+                preds = ml_clf.predict_top2_batch(
+                    [(a.title, a.body_text) for a in pending_articles]
+                )
+                predicted_map = {}
+                for article, (cat1, conf1, cat2, conf2) in zip(pending_articles, preds):
+                    sec_cat, sec_conf = filter_borderline_secondary(conf1, cat2, conf2)
+                    predicted_map[article.doc_id] = (cat1, conf1, sec_cat, sec_conf)
+
         newly_indexed = self.index_articles(
             pending_articles,
             source_by_feed_id=source_by_feed_id,
+            predicted_categories=predicted_map,
         )
         return IndexSyncResult(
             total_in_db=total_in_db,
@@ -289,12 +368,19 @@ class BM25Index:
             index_dir=str(self._index_dir),
         )
 
-    def rebuild_from_db(self, conn: sqlite3.Connection) -> IndexSyncResult:
+    def rebuild_from_db(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        apply_ml_classifier: bool = True,
+    ) -> IndexSyncResult:
         """Reset in-memory index structures and rebuild cleanly from all SQLite articles."""
         self._documents.clear()
         self._postings = {field: {} for field in IndexField}
         self._field_total_lengths = {field: 0 for field in IndexField}
-        result = self.sync_from_db(conn)
+        self._raw_vocab_df = None
+        self._raw_vocab_buckets = None
+        result = self.sync_from_db(conn, apply_ml_classifier=apply_ml_classifier)
         if result.total_in_db == 0:
             self._save()
         return result
@@ -322,7 +408,88 @@ class BM25Index:
         target = " " + " ".join(phrase_stems) + " "
         if target in _cached_field_stem_str(field_text):
             return True
+        if raw_phrase.lower() not in field_text.lower():
+            return False
         return bool(re.search(rf"\b{re.escape(raw_phrase)}\b", field_text, re.IGNORECASE))
+
+    @staticmethod
+    def _doc_effective_category(doc: IndexedDocument) -> str | None:
+        if doc.predicted_category:
+            return doc.predicted_category.strip().lower()
+        return normalize_category(doc.kicker)
+
+    def _ensure_raw_vocab(self) -> dict[tuple[str, int], list[tuple[str, int]]]:
+        if self._raw_vocab_buckets is not None:
+            return self._raw_vocab_buckets
+        vocab: Counter[str] = Counter()
+        for doc in self._documents.values():
+            words = set(_RAW_WORD_RE.findall(f"{doc.title} {doc.body_text[:2000]}".lower()))
+            for w in words:
+                if w not in ENGLISH_STOPWORDS:
+                    vocab[w] += 1
+        buckets: dict[tuple[str, int], list[tuple[str, int]]] = {}
+        for word, df in vocab.items():
+            buckets.setdefault((word[0], len(word)), []).append((word, df))
+        for bucket in buckets.values():
+            bucket.sort(key=lambda item: (-item[1], item[0]))
+        self._raw_vocab_df = vocab
+        self._raw_vocab_buckets = buckets
+        return buckets
+
+    def suggest_spelling(self, query: str) -> str | None:
+        """Suggest a corrected query when a non-stopword query word has zero index matches."""
+        if not query or not query.strip() or self.doc_count == 0:
+            return None
+        title_postings = self._postings[IndexField.TITLE]
+        body_postings = self._postings[IndexField.BODY]
+        buckets = self._ensure_raw_vocab()
+        if not buckets:
+            return None
+
+        tokens = re.findall(r"[A-Za-z0-9'-]+", query)
+        corrected_tokens: list[str] = []
+        changed = False
+
+        for raw_tok in tokens:
+            lower = raw_tok.lower()
+            if not lower.isalpha() or len(lower) < 4 or lower in ENGLISH_STOPWORDS:
+                corrected_tokens.append(raw_tok)
+                continue
+            stemmed = stem_token(lower)
+            if stemmed in title_postings or stemmed in body_postings:
+                corrected_tokens.append(raw_tok)
+                continue
+
+            best_word: str | None = None
+            best_key: tuple[int, int, str] | None = None
+            max_dist = 1 if len(lower) <= 4 else 2
+            first_char = lower[0]
+            qlen = len(lower)
+
+            for length in range(max(3, qlen - max_dist), qlen + max_dist + 1):
+                for cand, df in buckets.get((first_char, length), ())[:250]:
+                    dist = _edit_distance_le2(lower, cand)
+                    if dist == 0 or dist > max_dist:
+                        continue
+                    key = (dist, -df, cand)
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_word = cand
+                    if dist == 1:
+                        break
+
+            if best_word is not None:
+                corrected_tokens.append(best_word)
+                changed = True
+            else:
+                corrected_tokens.append(raw_tok)
+
+        if not changed:
+            return None
+        suggestion = " ".join(corrected_tokens)
+        if suggestion.lower() == query.strip().lower():
+            return None
+        return suggestion
 
     def _matches_filters(
         self,
@@ -334,10 +501,15 @@ class BM25Index:
         date_to: datetime | None = None,
     ) -> bool:
         if category:
-            norm_filter = normalize_category(category)
-            norm_doc_kicker = normalize_category(doc.kicker)
-            if not norm_doc_kicker or norm_doc_kicker != norm_filter:
-                return False
+            effective = self._doc_effective_category(doc)
+            if doc.predicted_category:
+                canon_filter = map_to_canonical_category(category) or normalize_category(category)
+                if not effective or effective != canon_filter:
+                    return False
+            else:
+                norm_filter = normalize_category(category)
+                if not effective or effective != norm_filter:
+                    return False
         if source:
             if not doc.source or doc.source.lower() != source.strip().lower():
                 return False
@@ -364,6 +536,8 @@ class BM25Index:
         concept_groups: Sequence[Sequence[str]] | None = None,
         min_should_match: float = 0.6,
         allow_empty_with_filters: bool = False,
+        sort: str = "relevance",
+        apply_recency_boost: bool = False,
     ) -> list[SearchHit]:
         """Score and rank matching documents using read-only multi-field Okapi BM25 with quorum."""
         if self.doc_count == 0 or top_k <= 0:
@@ -407,6 +581,8 @@ class BM25Index:
                     source=doc.source,
                     published_date=doc.published_date,
                     body_text=doc.body_text,
+                    predicted_category=doc.predicted_category,
+                    category_confidence=doc.category_confidence,
                     score=0.0,
                     matched_fields=[],
                     field_scores={},
@@ -419,6 +595,11 @@ class BM25Index:
         matched_fields_map: dict[str, set[IndexField]] = {}
         field_scores_map: dict[str, dict[IndexField, float]] = {}
         doc_matched_terms: dict[str, set[str]] = {}
+        quoted_phrases = [
+            (raw_p.strip(), preprocess_text(raw_p))
+            for raw_p in _QUOTED_PHRASE_RE.findall(query)
+            if raw_p.strip() and preprocess_text(raw_p)
+        ]
 
         for field in IndexField:
             weight = self._field_weights.get(field, 0.0)
@@ -522,6 +703,23 @@ class BM25Index:
                         doc_fscores[field] = doc_fscores.get(field, 0.0) + contribution
                         doc_matched_terms.setdefault(doc_id, set()).add(phrase_token)
 
+        # Enforce explicit quoted phrases when present
+        if quoted_phrases and scores:
+            for doc_id in list(scores.keys()):
+                doc = self._documents[doc_id]
+                matched_all = True
+                for raw_p, p_stems in quoted_phrases:
+                    if not (
+                        self._phrase_matches_field_text(doc.title, raw_p, p_stems)
+                        or self._phrase_matches_field_text(doc.body_text, raw_p, p_stems)
+                    ):
+                        matched_all = False
+                        break
+                if not matched_all:
+                    del scores[doc_id]
+                    matched_fields_map.pop(doc_id, None)
+                    field_scores_map.pop(doc_id, None)
+
         # Enforce quorum (minimum non-stopword concept overlap) & coordinate Soft-AND penalty
         if concept_groups is not None:
             resolved_concepts: list[set[str]] = [set(group) for group in concept_groups if group]
@@ -540,6 +738,8 @@ class BM25Index:
                     seen_default.add(term)
                     resolved_concepts.append({term})
 
+        explicit_years = set(re.findall(r"\b(?:19|20)\d{2}\b", query))
+
         num_concepts = len(resolved_concepts)
         if num_concepts > 1 and scores:
             clamped_msm = max(0.0, min(1.0, min_should_match))
@@ -548,6 +748,11 @@ class BM25Index:
             )
             for doc_id in list(scores.keys()):
                 matched_set = doc_matched_terms.get(doc_id, set())
+                if explicit_years and not (explicit_years & matched_set):
+                    del scores[doc_id]
+                    matched_fields_map.pop(doc_id, None)
+                    field_scores_map.pop(doc_id, None)
+                    continue
                 matched_concepts = sum(1 for group in resolved_concepts if group & matched_set)
                 if matched_concepts < required_concepts:
                     del scores[doc_id]
@@ -561,18 +766,89 @@ class BM25Index:
                         for f in doc_fscores:
                             doc_fscores[f] *= coord_factor
 
-        ranked_ids = sorted(
-            scores.keys(),
-            key=lambda doc_id: (
-                -scores[doc_id],
-                -(
-                    self._documents[doc_id].published_date.timestamp()
-                    if self._documents[doc_id].published_date is not None
-                    else 0.0
+        # Ordered bigram / exact phrase proximity boost for multi-word queries
+        query_stems = preprocess_text(query)
+        if len(query_stems) >= 2 and scores:
+            bigrams = [
+                f" {query_stems[i]} {query_stems[i + 1]} "
+                for i in range(len(query_stems) - 1)
+            ]
+            full_phrase = " " + " ".join(query_stems) + " "
+            for doc_id in list(scores.keys()):
+                doc = self._documents[doc_id]
+                doc_fscores = field_scores_map.get(doc_id, {})
+                title_stems = _cached_field_stem_str(doc.title)
+                body_stems = _cached_field_stem_str(doc.body_text)
+
+                if IndexField.TITLE in doc_fscores:
+                    if full_phrase in title_stems:
+                        boost = doc_fscores[IndexField.TITLE] * 0.40
+                    elif any(bg in title_stems for bg in bigrams):
+                        boost = doc_fscores[IndexField.TITLE] * 0.25
+                    else:
+                        boost = 0.0
+                    if boost > 0.0:
+                        doc_fscores[IndexField.TITLE] += boost
+                        scores[doc_id] += boost
+
+                if IndexField.BODY in doc_fscores:
+                    if full_phrase in body_stems:
+                        boost = doc_fscores[IndexField.BODY] * 0.25
+                    elif any(bg in body_stems for bg in bigrams):
+                        boost = doc_fscores[IndexField.BODY] * 0.12
+                    else:
+                        boost = 0.0
+                    if boost > 0.0:
+                        doc_fscores[IndexField.BODY] += boost
+                        scores[doc_id] += boost
+
+        # Mild freshness tie-breaker when recency boost is enabled in relevance mode
+        if apply_recency_boost and sort == "relevance" and scores:
+            dated_ts = [
+                self._documents[d].published_date.timestamp()
+                for d in scores
+                if self._documents[d].published_date is not None
+            ]
+            if dated_ts:
+                ref_ts = max(dated_ts)
+                for doc_id in list(scores.keys()):
+                    pub = self._documents[doc_id].published_date
+                    if pub is None:
+                        continue
+                    age_days = max(0.0, (ref_ts - pub.timestamp()) / 86400.0)
+                    mult = 1.0 + 0.10 * math.exp(-age_days / 14.0)
+                    scores[doc_id] *= mult
+                    doc_fscores = field_scores_map.get(doc_id)
+                    if doc_fscores:
+                        for f in doc_fscores:
+                            doc_fscores[f] *= mult
+
+        if sort == "latest":
+            ranked_ids = sorted(
+                scores.keys(),
+                key=lambda doc_id: (
+                    -(
+                        self._documents[doc_id].published_date.timestamp()
+                        if self._documents[doc_id].published_date is not None
+                        else 0.0
+                    ),
+                    -scores[doc_id],
+                    doc_id,
                 ),
-                doc_id,
-            ),
-        )[:top_k]
+            )[:top_k]
+        else:
+            ranked_ids = sorted(
+                scores.keys(),
+                key=lambda doc_id: (
+                    -scores[doc_id],
+                    -(
+                        self._documents[doc_id].published_date.timestamp()
+                        if self._documents[doc_id].published_date is not None
+                        else 0.0
+                    ),
+                    doc_id,
+                ),
+            )[:top_k]
 
         results: list[SearchHit] = []
         for doc_id in ranked_ids:
@@ -596,6 +872,10 @@ class BM25Index:
                     source=doc.source,
                     published_date=doc.published_date,
                     body_text=doc.body_text,
+                    predicted_category=doc.predicted_category,
+                    category_confidence=doc.category_confidence,
+                    secondary_category=doc.secondary_category,
+                    secondary_confidence=doc.secondary_confidence,
                     score=round(scores[doc_id], 6),
                     matched_fields=ordered_fields,
                     field_scores=ordered_fscores,
@@ -610,9 +890,9 @@ class BM25Index:
         dates: list[datetime] = []
 
         for doc in self._documents.values():
-            norm_cat = normalize_category(doc.kicker)
-            if norm_cat:
-                category_counts[norm_cat] += 1
+            eff_cat = self._doc_effective_category(doc)
+            if eff_cat:
+                category_counts[eff_cat] += 1
             if doc.source:
                 source_counts[doc.source] += 1
             if doc.published_date is not None:

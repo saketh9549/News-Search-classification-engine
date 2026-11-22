@@ -98,6 +98,8 @@ class SearchResultItem(BaseModel):
     entities: list[NamedEntity] = Field(default_factory=list)
     predicted_category: NonEmptyStr = "world"
     category_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    secondary_category: OptionalCleanStr = None
+    secondary_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     background_links: list[BackgroundLink] = Field(default_factory=list)
 
 
@@ -112,6 +114,8 @@ class SearchResponse(BaseModel):
     facets: CorpusOverview = Field(default_factory=lambda: CorpusOverview(doc_count=0))
     query_debug: QueryDebugInfo | None = None
     unfiltered_total_hits: int | None = Field(default=None, ge=0)
+    did_you_mean: OptionalCleanStr = None
+    sort: NonEmptyStr = "relevance"
     suggestions: list[str] = Field(default_factory=list)
 
 

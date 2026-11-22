@@ -98,6 +98,14 @@ BANNED_PERSON_FALSE_POSITIVES: frozenset[str] = frozenset(
         "Jantar Mantar",
         "Ramlila Maidan",
         "Getty Images",
+        "Coefficient Giving",
+        "Morgan Stanley",
+        "Hugging Face",
+        "Charles Schwab",
+        "Tata Sons",
+        "External Affairs",
+        "Nifty Track",
+        "Balasubramanyam C.P",
     }
 )
 

@@ -34,6 +34,7 @@ def _row_to_feed(row: sqlite3.Row) -> Feed:
 
 
 def _row_to_frontier_item(row: sqlite3.Row) -> FrontierItem:
+    keys = row.keys()
     return FrontierItem(
         id=row["id"],
         feed_id=row["feed_id"],
@@ -45,6 +46,9 @@ def _row_to_frontier_item(row: sqlite3.Row) -> FrontierItem:
         next_attempt_at=row["next_attempt_at"],
         last_http_status=row["last_http_status"],
         discovered_at=row["discovered_at"],
+        rss_title=row["rss_title"] if "rss_title" in keys else None,
+        rss_summary=row["rss_summary"] if "rss_summary" in keys else None,
+        rss_published_at=row["rss_published_at"] if "rss_published_at" in keys else None,
     )
 
 
@@ -130,6 +134,9 @@ def enqueue_frontier_items(
             to_iso8601_utc(item.next_attempt_at) if item.next_attempt_at else None,
             item.last_http_status,
             to_iso8601_utc(item.discovered_at),
+            item.rss_title,
+            item.rss_summary,
+            to_iso8601_utc(item.rss_published_at) if item.rss_published_at else None,
         )
         for item in items
     ]
@@ -146,12 +153,42 @@ def enqueue_frontier_items(
                 retry_count,
                 next_attempt_at,
                 last_http_status,
-                discovered_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                discovered_at,
+                rss_title,
+                rss_summary,
+                rss_published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             rows,
         )
-    return conn.total_changes - before
+    inserted = conn.total_changes - before
+
+    # Backfill RSS metadata on previously enqueued pending items that lacked title/summary
+    backfill_rows = [
+        (
+            item.rss_title,
+            item.rss_summary,
+            to_iso8601_utc(item.rss_published_at) if item.rss_published_at else None,
+            item.url,
+        )
+        for item in items
+        if item.rss_title or item.rss_summary or item.rss_published_at
+    ]
+    if backfill_rows:
+        with conn:
+            conn.executemany(
+                """
+                UPDATE crawl_frontier
+                SET rss_title = COALESCE(rss_title, ?),
+                    rss_summary = COALESCE(rss_summary, ?),
+                    rss_published_at = COALESCE(rss_published_at, ?)
+                WHERE url = ?
+                  AND (rss_title IS NULL OR rss_summary IS NULL OR rss_published_at IS NULL);
+                """,
+                backfill_rows,
+            )
+
+    return inserted
 
 
 def reset_stale_in_progress_items(conn: sqlite3.Connection) -> int:
@@ -195,25 +232,31 @@ def get_due_frontier_items(
         rows = conn.execute(
             """
             SELECT id, feed_id, url, guid, domain, status, retry_count,
-                   next_attempt_at, last_http_status, discovered_at
+                   next_attempt_at, last_http_status, discovered_at,
+                   rss_title, rss_summary, rss_published_at
             FROM (
                 SELECT *,
                        ROW_NUMBER() OVER (
                            PARTITION BY domain
-                           ORDER BY _feed_rank ASC, julianday(discovered_at) ASC, id ASC
+                           ORDER BY _feed_rank ASC,
+                                    julianday(COALESCE(rss_published_at, discovered_at)) DESC,
+                                    id ASC
                        ) AS _domain_rank
                 FROM (
                     SELECT *,
                            ROW_NUMBER() OVER (
                                PARTITION BY feed_id
-                               ORDER BY julianday(discovered_at) ASC, id ASC
+                               ORDER BY julianday(COALESCE(rss_published_at, discovered_at)) DESC,
+                                        id ASC
                            ) AS _feed_rank
                     FROM crawl_frontier
                     WHERE status = 'pending'
                       AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?))
                 )
             )
-            ORDER BY _domain_rank ASC, julianday(discovered_at) ASC, id ASC
+            ORDER BY _domain_rank ASC,
+                     julianday(COALESCE(rss_published_at, discovered_at)) DESC,
+                     id ASC
             LIMIT ?;
             """,
             (now_iso, limit),
@@ -230,6 +273,118 @@ def get_due_frontier_items(
             (now_iso, limit),
         ).fetchall()
     return [_row_to_frontier_item(row) for row in rows]
+
+
+def find_matching_pending_frontier_items(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    limit: int = 8,
+    max_per_domain: int = 2,
+    now: datetime | None = None,
+    exclude_domains: set[str] | frozenset[str] | None = None,
+) -> list[FrontierItem]:
+    """Select the highest-relevance, freshest uncrawled frontier items matching a search query."""
+    import math
+    import re
+    from urllib.parse import urlsplit
+
+    from src.indexer.preprocessing import preprocess_text
+    from src.search.expansion import inspect_and_expand_query
+
+    if not query or not query.strip() or limit <= 0:
+        return []
+
+    analysis = inspect_and_expand_query(query)
+    concept_groups = [set(g) for g in analysis.concept_groups if g]
+    if not concept_groups:
+        stems = preprocess_text(query)
+        concept_groups = [{s} for s in dict.fromkeys(stems)]
+    if not concept_groups:
+        return []
+
+    raw_phrase = " ".join(preprocess_text(query))
+    now_dt = now or utc_now()
+    now_iso = to_iso8601_utc(now_dt)
+    excluded = {d.lower() for d in (exclude_domains or ())}
+
+    rows = conn.execute(
+        """
+        SELECT id, feed_id, url, guid, domain, status, retry_count,
+               next_attempt_at, last_http_status, discovered_at,
+               rss_title, rss_summary, rss_published_at
+        FROM crawl_frontier
+        WHERE status = 'pending'
+          AND (next_attempt_at IS NULL OR julianday(next_attempt_at) <= julianday(?))
+        ORDER BY julianday(COALESCE(rss_published_at, discovered_at)) DESC, id DESC
+        LIMIT 3000;
+        """,
+        (now_iso,),
+    ).fetchall()
+
+    slug_split_re = re.compile(r"[^a-zA-Z0-9]+")
+    num_concepts = len(concept_groups)
+    required_concepts = 1 if num_concepts == 1 else (2 if num_concepts == 2 else math.ceil(num_concepts * 0.6))
+
+    scored: list[tuple[float, int, float, FrontierItem]] = []
+    for row in rows:
+        dom = str(row["domain"] or "").lower()
+        if dom in excluded:
+            continue
+        item = _row_to_frontier_item(row)
+        title_str = item.rss_title or ""
+        summary_str = item.rss_summary or ""
+        slug_str = slug_split_re.sub(" ", urlsplit(item.url).path or "")
+
+        title_stems = preprocess_text(title_str) if title_str else []
+        slug_stems = preprocess_text(slug_str) if slug_str else []
+        summary_stems = preprocess_text(summary_str) if summary_str else []
+
+        title_set = set(title_stems)
+        slug_set = set(slug_stems)
+        summary_set = set(summary_stems)
+        combined_set = title_set | slug_set | summary_set
+        if not combined_set:
+            continue
+
+        matched_concepts = sum(1 for group in concept_groups if group & combined_set)
+        if matched_concepts < required_concepts:
+            continue
+
+        score = 0.0
+        for group in concept_groups:
+            if group & title_set:
+                score += 3.0
+            if group & slug_set:
+                score += 2.0
+            if group & summary_set:
+                score += 1.0
+
+        if raw_phrase and len(raw_phrase.split()) >= 2:
+            if f" {raw_phrase} " in f" {' '.join(title_stems)} ":
+                score += 4.0
+            elif f" {raw_phrase} " in f" {' '.join(slug_stems)} ":
+                score += 2.5
+
+        ref_dt = item.rss_published_at or item.discovered_at
+        age_hours = max(0.0, (now_dt - ref_dt).total_seconds() / 3600.0)
+        freshness_bonus = 1.5 * math.exp(-age_hours / 48.0)
+        total_score = score * (matched_concepts / num_concepts) + freshness_bonus
+        scored.append((total_score, matched_concepts, ref_dt.timestamp(), item))
+
+    scored.sort(key=lambda entry: (-entry[0], -entry[1], -entry[2], entry[3].id or 0))
+
+    selected: list[FrontierItem] = []
+    domain_counts: dict[str, int] = {}
+    for _, _, _, item in scored:
+        if len(selected) >= limit:
+            break
+        dom = item.domain.lower()
+        if domain_counts.get(dom, 0) >= max_per_domain:
+            continue
+        domain_counts[dom] = domain_counts.get(dom, 0) + 1
+        selected.append(item)
+    return selected
 
 
 def update_frontier_status(

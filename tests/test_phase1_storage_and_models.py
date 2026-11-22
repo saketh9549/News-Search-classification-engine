@@ -89,6 +89,9 @@ def test_schema_columns_match_specification(tmp_path: Path) -> None:
             "next_attempt_at",
             "last_http_status",
             "discovered_at",
+            "rss_title",
+            "rss_summary",
+            "rss_published_at",
         ]
         assert cols("articles") == [
             "doc_id",

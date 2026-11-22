@@ -363,3 +363,53 @@ def test_extract_uses_json_ld_article_body_when_ssr_dom_is_short() -> None:
     assert res.word_count >= 80
     assert res.article is not None
     assert "regional grid interconnection framework" in res.article.body_text
+
+
+def test_extractor_strips_boilerplate_paragraphs_and_rejects_bbc_sounds() -> None:
+    """Verify promo/newsletter paragraphs are stripped and BBC Sounds podcast pages are rejected."""
+    html_with_promos = f"""<!DOCTYPE html>
+<html>
+<head><title>Clean Energy Summit Concludes in Geneva</title></head>
+<body>
+  <article>
+    <h1>Clean Energy Summit Concludes in Geneva</h1>
+    <p>Sign up for our morning newsletter to get daily updates.</p>
+    <p>{LONG_PARAGRAPH_1}</p>
+    <p>Read more: Click here for ten things to watch today.</p>
+    <p>Download TOI app for breaking alerts.</p>
+    <p>{LONG_PARAGRAPH_2}</p>
+    <p>Image source, Getty Images</p>
+  </article>
+</body>
+</html>"""
+    res = extract_article(
+        _make_crawl_result(
+            html=html_with_promos,
+            url="https://www.theguardian.com/world/2026/nov/21/clean-energy-summit",
+            final_url="https://www.theguardian.com/world/2026/nov/21/clean-energy-summit",
+            feed_id=13,
+        )
+    )
+    assert res.accepted is True
+    assert res.article is not None
+    body_l = res.article.body_text.lower()
+    assert "sign up for our morning newsletter" not in body_l
+    assert "download toi app" not in body_l
+    assert "getty images" not in body_l
+    assert "regional grid interconnection framework" in body_l
+
+    podcast_html = f"""<!DOCTYPE html>
+<html>
+<head><title>Tech Life - Beyond silicon chips - BBC Sounds</title></head>
+<body><article><p>{LONG_PARAGRAPH_1} {LONG_PARAGRAPH_2}</p></article></body>
+</html>"""
+    pod_res = extract_article(
+        _make_crawl_result(
+            html=podcast_html,
+            url="https://www.bbc.co.uk/sounds/play/w3ct8jyw",
+            final_url="https://www.bbc.co.uk/sounds/play/w3ct8jyw",
+            feed_id=2,
+        )
+    )
+    assert pod_res.accepted is False
+    assert pod_res.rejection_reason is not None and "podcast" in pod_res.rejection_reason.lower()

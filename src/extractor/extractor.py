@@ -21,13 +21,36 @@ from src.extractor.schemas import (
 )
 from src.models.schemas import Article, normalize_category, utc_now
 from src.models.urls import normalize_url
-from src.poller.parser import parse_feed_timestamp
+from src.poller.parser import is_article_url, parse_feed_timestamp
 from src.storage.repository import get_feed_by_id, save_article
 
 logger = logging.getLogger(__name__)
 
 _WHITESPACE_RE = re.compile(r"\s+")
-_WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,;!?)\]]|\.(?!\d))")
+_SPACE_AFTER_OPEN_RE = re.compile(r"([(\[])\s+")
+_DUP_COMMA_RE = re.compile(r",\s*,+")
+_COMMA_PERIOD_RE = re.compile(r",\s*\.(?!\d)")
+_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", re.UNICODE)
+_BOILERPLATE_PARAGRAPH_RE = re.compile(
+    r"^(?:"
+    r"sign\s+up\b|subscribe\b|follow\s+us\b|read\s+more\b|also\s+read\b|"
+    r"watch\s*:|listen\s*:|image\s+source\b|image\s+caption\b|"
+    r"getty\s+images\b|related\s+topics?\b|more\s+on\s+this\s+story\b|"
+    r"recommended\s+stories\b|download\s+(?:the\s+)?(?:toi|times|hindu|ht|app)\b|"
+    r"published\s+by\b|published\s*[-–—:]|updated\s*[-–—:]|"
+    r"copyright\s+©|all\s+rights\s+reserved\b|"
+    r"click\s+here\b|download\s+the\b|join\s+our\b"
+    r")",
+    re.IGNORECASE,
+)
+_INLINE_CREDIT_RE = re.compile(
+    r"\s*(?:\((?:getty\s+images|reuters|ap\s+photo|afp|pti|file\s+photo)\)|"
+    r"image\s+source,\s*getty\s+images|"
+    r"\|\s*(?:photo\s+credit|file\s+photo|image\s+credit)\s*:[^\n]*)\s*",
+    re.IGNORECASE,
+)
+_NON_ARTICLE_PAGE_TITLE_RE = re.compile(r"(?:\s-\s*bbc\s+sounds$)", re.IGNORECASE)
 _BOILERPLATE_ATTR_RE = re.compile(
     r"(?:^|[-_\s])("
     r"ad|ads|advert|advertisement|promo|sponsored|sidebar|social|share|"
@@ -69,7 +92,12 @@ def _clean_text(raw: str | None) -> str:
     if not raw:
         return ""
     unescaped = html_lib.unescape(raw)
-    return _WHITESPACE_RE.sub(" ", unescaped).strip()
+    cleaned = _WHITESPACE_RE.sub(" ", unescaped).strip()
+    cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
+    cleaned = _SPACE_AFTER_OPEN_RE.sub(r"\1", cleaned)
+    cleaned = _DUP_COMMA_RE.sub(",", cleaned)
+    cleaned = _COMMA_PERIOD_RE.sub(".", cleaned)
+    return _WHITESPACE_RE.sub(" ", cleaned).strip()
 
 
 def _extract_words(text: str) -> list[str]:
@@ -376,6 +404,24 @@ def _select_primary_container(body: lxml_html.HtmlElement) -> lxml_html.HtmlElem
     return body
 
 
+def _clean_paragraph_blocks(blocks: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw_block in blocks:
+        text = _INLINE_CREDIT_RE.sub(" ", raw_block)
+        text = _WHITESPACE_RE.sub(" ", text).strip()
+        if not text:
+            continue
+        if _BOILERPLATE_PARAGRAPH_RE.match(text) and len(_extract_words(text)) <= 35:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned
+
+
 def _extract_body_and_density(
     doc: lxml_html.HtmlElement,
     ld: dict[str, object],
@@ -396,12 +442,13 @@ def _extract_body_and_density(
     )
     link_to_text_ratio = min(1.0, link_words / total_words) if total_words > 0 else 1.0
 
-    blocks: list[str] = []
+    raw_blocks: list[str] = []
     for node in container.xpath(".//p | .//h2 | .//h3 | .//blockquote[not(.//p)]"):
         text = _clean_text(node.text_content())
         if text:
-            blocks.append(text)
+            raw_blocks.append(text)
 
+    blocks = _clean_paragraph_blocks(raw_blocks)
     if blocks:
         body_text = "\n\n".join(blocks)
     elif total_text:
@@ -411,7 +458,10 @@ def _extract_body_and_density(
 
     ld_body = ld.get("articleBody")
     if isinstance(ld_body, str):
-        cleaned_ld = _clean_text(ld_body)
+        cleaned_ld_paragraphs = _clean_paragraph_blocks(
+            [_clean_text(p) for p in re.split(r"\n+", ld_body) if _clean_text(p)]
+        )
+        cleaned_ld = "\n\n".join(cleaned_ld_paragraphs) if cleaned_ld_paragraphs else _clean_text(ld_body)
         if cleaned_ld:
             dom_words = len(_extract_words(body_text))
             ld_words = len(_extract_words(cleaned_ld))
@@ -460,8 +510,20 @@ def extract_article(
             accepted=False,
             rejection_reason="Missing article headline",
         )
-
+    raw_doc_title = " ".join(
+        _clean_text(node.text_content()) for node in doc.xpath("//title")
+    )
     canonical_url = _extract_canonical_url(doc, ld, crawl_result.final_url)
+    if (
+        _NON_ARTICLE_PAGE_TITLE_RE.search(title)
+        or _NON_ARTICLE_PAGE_TITLE_RE.search(raw_doc_title)
+        or not is_article_url(canonical_url)
+    ):
+        return ExtractionResult(
+            accepted=False,
+            rejection_reason=f"Non-article audio/podcast or multimedia page ({canonical_url})",
+        )
+
     published_date = _extract_published_date(doc, ld)
     author = _extract_author(doc, ld)
     kicker = _extract_kicker(doc, ld, default_kicker)

@@ -59,6 +59,103 @@ _CATEGORY_ALIASES: dict[str, str] = {
 }
 
 
+CANONICAL_CATEGORIES: tuple[str, ...] = (
+    "world",
+    "india",
+    "business",
+    "technology",
+    "sport",
+    "science_health",
+    "politics",
+    "entertainment",
+)
+
+_CANONICAL_CATEGORY_MAP: dict[str, str] = {
+    "world": "world",
+    "international": "world",
+    "global": "world",
+    "europe": "world",
+    "asia": "world",
+    "africa": "world",
+    "middle east": "world",
+    "us & canada": "world",
+    "latin america": "world",
+    "uk": "world",
+    "england": "world",
+    "scotland": "world",
+    "wales": "world",
+    "northern ireland": "world",
+    "world news": "world",
+    "india": "india",
+    "india news": "india",
+    "states": "india",
+    "national": "india",
+    "national news": "india",
+    "west bengal": "india",
+    "keralam": "india",
+    "cities": "india",
+    "business": "business",
+    "business & economy": "business",
+    "economy": "business",
+    "markets": "business",
+    "finance": "business",
+    "industry": "business",
+    "companies": "business",
+    "jobs": "business",
+    "money": "business",
+    "technology": "technology",
+    "tech": "technology",
+    "ai": "technology",
+    "computing": "technology",
+    "gadgets": "technology",
+    "sport": "sport",
+    "sports": "sport",
+    "sport front page": "sport",
+    "cricket": "sport",
+    "football": "sport",
+    "tennis": "sport",
+    "athletics": "sport",
+    "formula 1": "sport",
+    "badminton": "sport",
+    "hockey": "sport",
+    "olympics": "sport",
+    "science_health": "science_health",
+    "science": "science_health",
+    "health": "science_health",
+    "science & environment": "science_health",
+    "science & technology": "science_health",
+    "sci-tech": "science_health",
+    "environment": "science_health",
+    "climate": "science_health",
+    "medicine": "science_health",
+    "space": "science_health",
+    "politics": "politics",
+    "elections": "politics",
+    "policy": "politics",
+    "government": "politics",
+    "parliament": "politics",
+    "us politics": "politics",
+    "uk politics": "politics",
+    "entertainment": "entertainment",
+    "culture": "entertainment",
+    "arts": "entertainment",
+    "entertainment & arts": "entertainment",
+    "lifestyle": "entertainment",
+    "movies": "entertainment",
+    "music": "entertainment",
+    "books": "entertainment",
+    "film": "entertainment",
+    "tv": "entertainment",
+    "stage": "entertainment",
+    "television & radio": "entertainment",
+    "art and design": "entertainment",
+}
+
+GENERIC_FEED_CATEGORIES: frozenset[str] = frozenset(
+    {"top_stories", "top stories", "news", "home", "bbc indepth", "bbc verify", "latest"}
+)
+
+
 def normalize_category(raw: str | None) -> str | None:
     """Normalize article category/kicker labels to canonical lowercase slugs."""
     if raw is None:
@@ -67,6 +164,21 @@ def normalize_category(raw: str | None) -> str | None:
     if not cleaned:
         return None
     return _CATEGORY_ALIASES.get(cleaned, cleaned)
+
+
+def map_to_canonical_category(raw: str | None) -> str | None:
+    """Map any RSS section or HTML kicker into the 8-class canonical news taxonomy."""
+    if raw is None:
+        return None
+    cleaned = _CATEGORY_WS_RE.sub(" ", raw).strip().lower()
+    if not cleaned or cleaned in GENERIC_FEED_CATEGORIES:
+        return None
+    if cleaned in _CANONICAL_CATEGORY_MAP:
+        return _CANONICAL_CATEGORY_MAP[cleaned]
+    normalized = normalize_category(cleaned)
+    if normalized and normalized in _CANONICAL_CATEGORY_MAP:
+        return _CANONICAL_CATEGORY_MAP[normalized]
+    return None
 
 
 def utc_now() -> datetime:
@@ -176,6 +288,9 @@ class FrontierItem(BaseModel):
     next_attempt_at: UtcDatetime | None = None
     last_http_status: int | None = Field(default=None, ge=100, le=599)
     discovered_at: UtcDatetime = Field(default_factory=utc_now)
+    rss_title: OptionalCleanStr = None
+    rss_summary: OptionalCleanStr = None
+    rss_published_at: UtcDatetime | None = None
 
 
 class Article(BaseModel):

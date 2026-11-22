@@ -19,6 +19,47 @@ _WORD_SPAN_RE = re.compile(
     r"\b(?:under-\d{2}|[A-Za-z]{1,6}-\d{1,4})\b|[A-Za-z0-9]+",
     re.IGNORECASE,
 )
+_DATELINE_LINE_RE = re.compile(
+    r"^(?:updated|published)\s*[-–—:]\s*.*$",
+    re.IGNORECASE,
+)
+_INLINE_PHOTO_CREDIT_RE = re.compile(
+    r"\s*\|\s*(?:photo\s+credit|file\s+photo|image\s+credit|credit)\b[^\n]*$",
+    re.IGNORECASE,
+)
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,;!?)\]]|\.(?!\d))")
+_SPACE_BEFORE_COLON_RE = re.compile(r"(?<=[A-Za-z])\s+:")
+_SPACE_AFTER_OPEN_RE = re.compile(r"([(\[])\s+")
+_DUP_COMMA_RE = re.compile(r",\s*,+")
+_COMMA_PERIOD_RE = re.compile(r",\s*\.(?!\d)")
+
+
+def _clean_single_block(block: str) -> str:
+    cleaned = _INLINE_PHOTO_CREDIT_RE.sub("", block)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
+    cleaned = _SPACE_BEFORE_COLON_RE.sub(":", cleaned)
+    cleaned = _SPACE_AFTER_OPEN_RE.sub(r"\1", cleaned)
+    cleaned = _DUP_COMMA_RE.sub(",", cleaned)
+    cleaned = _COMMA_PERIOD_RE.sub(".", cleaned)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def normalize_snippet_text(text: str) -> str:
+    """Clean stray whitespace, dateline banners, photo credits, and broken punctuation spacing."""
+    if not text:
+        return ""
+    kept_blocks: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or _DATELINE_LINE_RE.match(stripped):
+            continue
+        cleaned = _clean_single_block(stripped)
+        if cleaned:
+            kept_blocks.append(cleaned)
+    return " ".join(kept_blocks)
 
 
 @functools.lru_cache(maxsize=2048)
@@ -114,11 +155,25 @@ def _find_highlight_spans(
 def prepare_body_sentences(
     body_text: str,
 ) -> tuple[str, tuple[str, ...], tuple[tuple[tuple[str, str], ...], ...]]:
-    """Collapse whitespace, split sentences, and precompute normalized/stemmed token pairs."""
-    collapsed = re.sub(r"\s+", " ", body_text).strip()
-    if not collapsed:
+    """Normalize paragraphs, split sentences on boundaries, and precompute stem pairs."""
+    if not body_text or not body_text.strip():
         return "", (), ()
-    sentences = tuple(s.strip() for s in _SENTENCE_SPLIT_RE.split(collapsed) if s.strip())
+    sentence_list: list[str] = []
+    for raw_line in body_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or _DATELINE_LINE_RE.match(stripped):
+            continue
+        cleaned_block = _clean_single_block(stripped)
+        if not cleaned_block:
+            continue
+        for part in _SENTENCE_SPLIT_RE.split(cleaned_block):
+            s = part.strip()
+            if s:
+                sentence_list.append(s)
+    if not sentence_list:
+        return "", (), ()
+    sentences = tuple(sentence_list)
+    collapsed = " ".join(sentences)
     sent_tokens: list[tuple[tuple[str, str], ...]] = []
     for s in sentences:
         pairs: list[tuple[str, str]] = []
@@ -159,7 +214,8 @@ def _select_best_window(
         window = sentence
         matches = sentence_scores[idx]
         if len(window) < max_chars * 0.6 and idx + 1 < len(sentences):
-            window = f"{window} {sentences[idx + 1]}"
+            sep = " " if window[-1] in ".!?:;—–-" else " — "
+            window = f"{window}{sep}{sentences[idx + 1]}"
             matches += sentence_scores[idx + 1]
         if matches > best_score:
             best_score = matches
@@ -234,9 +290,10 @@ def highlight_text(
     """Safely HTML-escape text and wrap matching query/expanded terms in highlight tags."""
     if not text:
         return ""
+    cleaned = normalize_snippet_text(text)
     raw_terms, stems, phrase_patterns = _query_match_sets(query, extra_terms=extra_terms)
     return _render_highlighted(
-        text,
+        cleaned,
         raw_terms,
         stems,
         phrase_patterns,

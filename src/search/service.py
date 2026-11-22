@@ -10,9 +10,10 @@ from src.indexer.bm25_index import BM25Index, _cached_field_stem_str
 from src.indexer.preprocessing import preprocess_text
 from src.indexer.schemas import IndexField
 from src.models.schemas import to_iso8601_utc
-from src.search.classifier import predict_category
+from src.search.classifier import predict_category_top2
 from src.search.context import (
     aggregate_entities,
+    build_background_link_artifacts,
     extract_entities,
     suggest_background_links,
 )
@@ -77,7 +78,7 @@ class SearchService:
         self._cached_doc_count: int = -1
         self._cached_doc_ids: frozenset[str] = frozenset()
         self._entities_cache: dict[str, list[NamedEntity]] = {}
-        self._category_cache: dict[str, tuple[str, float]] = {}
+        self._category_cache: dict[str, tuple[str, float, str | None, float | None]] = {}
         self._background_cache: dict[str, list[BackgroundLink]] = {}
         self._overview_cache: CorpusOverview | None = None
         self._ensure_caches()
@@ -125,7 +126,7 @@ class SearchService:
             return
 
         entities_cache: dict[str, list[NamedEntity]] = {}
-        category_cache: dict[str, tuple[str, float]] = {}
+        category_cache: dict[str, tuple[str, float, str | None, float | None]] = {}
         body_entities_for_bg: dict[str, list[NamedEntity]] = {}
         token_sets_by_doc: dict[str, set[str]] = {}
 
@@ -137,19 +138,32 @@ class SearchService:
         for doc in docs:
             entities_cache[doc.doc_id] = extract_entities(
                 doc.body_text,
-                author=doc.author,
+                author=None,
+                exclude_authors=doc.author,
+                strip_bylines=True,
                 max_entities=self._MAX_CACHED_ENTITIES,
             )
             body_entities_for_bg[doc.doc_id] = extract_entities(
                 doc.body_text,
                 author=None,
+                exclude_authors=doc.author,
+                strip_bylines=True,
                 max_entities=12,
             )
-            category_cache[doc.doc_id] = predict_category(
-                doc.title,
-                doc.body_text,
-                kicker=doc.kicker,
-            )
+            if doc.predicted_category is not None and doc.category_confidence is not None:
+                category_cache[doc.doc_id] = (
+                    doc.predicted_category,
+                    doc.category_confidence,
+                    doc.secondary_category,
+                    doc.secondary_confidence,
+                )
+            else:
+                category_cache[doc.doc_id] = predict_category_top2(
+                    doc.title,
+                    doc.body_text,
+                    kicker=doc.kicker,
+                    use_ml=(doc_count >= 20),
+                )
             token_sets_by_doc[doc.doc_id] = set(
                 preprocess_text(f"{doc.title} {doc.body_text[:1200]}")
             )
@@ -159,6 +173,9 @@ class SearchService:
             _cached_field_stem_str(doc.body_text)
             prepare_body_sentences(doc.body_text)
 
+        tfidf_matrix, doc_id_to_row, entity_idf = build_background_link_artifacts(
+            docs, body_entities_for_bg
+        )
         background_cache: dict[str, list[BackgroundLink]] = {}
         for doc in docs:
             background_cache[doc.doc_id] = suggest_background_links(
@@ -167,12 +184,17 @@ class SearchService:
                 limit=self._MAX_CACHED_BACKGROUND_LINKS,
                 entities_by_doc=body_entities_for_bg,
                 token_sets_by_doc=token_sets_by_doc,
+                docs_ordered=docs,
+                tfidf_matrix=tfidf_matrix,
+                doc_id_to_row=doc_id_to_row,
+                entity_idf=entity_idf,
             )
 
         self._entities_cache = entities_cache
         self._category_cache = category_cache
         self._background_cache = background_cache
         self._overview_cache = self._build_corpus_overview()
+        self._index._ensure_raw_vocab()
         self._cached_doc_count = doc_count
         self._cached_doc_ids = doc_ids
 
@@ -191,6 +213,7 @@ class SearchService:
         source: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        sort: str = "relevance",
         snippet_max_chars: int = 240,
         max_entities_per_doc: int = 8,
         background_limit: int = 3,
@@ -198,6 +221,7 @@ class SearchService:
         """Execute read-only multi-field BM25 query with expansion, NER, classification, and background links."""
         self._ensure_caches()
         started = perf_counter()
+        normalized_sort = "latest" if str(sort).strip().lower() == "latest" else "relevance"
         has_active_filters = bool(
             (category and category.strip())
             or (source and source.strip())
@@ -219,6 +243,8 @@ class SearchService:
             expansion_phrases=expanded_phrases,
             concept_groups=concept_groups,
             allow_empty_with_filters=has_active_filters,
+            sort=normalized_sort,
+            apply_recency_boost=(normalized_sort == "relevance" and self._index.doc_count >= 20),
         )
 
         unfiltered_total_hits: int | None = None
@@ -255,7 +281,9 @@ class SearchService:
             else:
                 entities = extract_entities(
                     hit.body_text,
-                    author=hit.author,
+                    author=None,
+                    exclude_authors=hit.author,
+                    strip_bylines=True,
                     max_entities=max_entities_per_doc,
                 )
             per_doc_entities.append(entities)
@@ -271,9 +299,19 @@ class SearchService:
             ]
             cached_category = self._category_cache.get(hit.doc_id)
             if cached_category is not None:
-                predicted_category, category_confidence = cached_category
+                (
+                    predicted_category,
+                    category_confidence,
+                    secondary_category,
+                    secondary_confidence,
+                ) = cached_category
             else:
-                predicted_category, category_confidence = predict_category(
+                (
+                    predicted_category,
+                    category_confidence,
+                    secondary_category,
+                    secondary_confidence,
+                ) = predict_category_top2(
                     hit.title,
                     hit.body_text,
                     kicker=hit.kicker,
@@ -314,6 +352,8 @@ class SearchService:
                     entities=entities,
                     predicted_category=predicted_category,
                     category_confidence=category_confidence,
+                    secondary_category=secondary_category,
+                    secondary_confidence=secondary_confidence,
                     background_links=background_links,
                 )
             )
@@ -321,10 +361,14 @@ class SearchService:
         elapsed_ms = round((perf_counter() - started) * 1000.0, 2)
         top_entities = aggregate_entities(per_doc_entities, max_entities=15)
         facets = self.get_corpus_overview()
+        did_you_mean = self._index.suggest_spelling(query) if query.strip() else None
 
         suggestions: list[str] = []
         if not results:
             seen_sugg: set[str] = set()
+            if did_you_mean:
+                seen_sugg.add(did_you_mean.lower())
+                suggestions.append(did_you_mean)
             for phrases in analysis.expanded_terms.values():
                 for phrase in phrases:
                     lowered = phrase.lower()
@@ -361,6 +405,8 @@ class SearchService:
             facets=facets,
             query_debug=query_debug,
             unfiltered_total_hits=unfiltered_total_hits,
+            did_you_mean=did_you_mean,
+            sort=normalized_sort,
             suggestions=suggestions[:6],
         )
 
@@ -380,7 +426,9 @@ class SearchService:
         else:
             entities = extract_entities(
                 doc.body_text,
-                author=doc.author,
+                author=None,
+                exclude_authors=doc.author,
+                strip_bylines=True,
                 max_entities=15,
             )
         if (

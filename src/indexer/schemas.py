@@ -46,6 +46,10 @@ class IndexedDocument(BaseModel):
     source: OptionalCleanStr = None
     published_date: UtcDatetime | None = None
     body_text: NonEmptyStr
+    predicted_category: OptionalCleanStr = None
+    category_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    secondary_category: OptionalCleanStr = None
+    secondary_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     field_lengths: dict[IndexField, int] = Field(default_factory=dict)
 
 
@@ -72,6 +76,10 @@ class SearchHit(BaseModel):
     source: OptionalCleanStr = None
     published_date: UtcDatetime | None = None
     body_text: NonEmptyStr
+    predicted_category: OptionalCleanStr = None
+    category_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    secondary_category: OptionalCleanStr = None
+    secondary_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     score: float = Field(ge=0.0)
     matched_fields: list[IndexField] = Field(default_factory=list)
     field_scores: dict[IndexField, float] = Field(default_factory=dict)

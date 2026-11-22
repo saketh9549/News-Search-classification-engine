@@ -1,16 +1,21 @@
-"""FastAPI search interface and lightweight HTML UI for the News Search Engine."""
+"""FastAPI REST API and XSS-safe web UI for multi-field BM25 news search & ML evaluation."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 
 from src.indexer.bm25_index import BM25Index
 from src.indexer.schemas import DEFAULT_INDEX_DIR
+from src.search.classifier import DEFAULT_METRICS_PATH, load_classifier_metrics
+from src.search.live_retriever import LiveQueryRetriever
 from src.search.schemas import (
     ArticleDetailResponse,
     BackgroundLink,
@@ -20,9 +25,12 @@ from src.search.schemas import (
     SearchResponse,
 )
 from src.search.service import SearchService, parse_date_boundary
+from src.storage.init_db import DEFAULT_DB_PATH, get_connection
 
 _ROBOTS_TXT_PATH = Path(__file__).resolve().parents[2] / "robots.txt"
 _DEFAULT_ROBOTS_TXT = "User-agent: *\nAllow: /\nDisallow: /api/\n"
+_SEARCH_UI_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "search_ui.html"
+DEFAULT_EVAL_QRELS_PATH = Path("data/eval_qrels.json")
 
 
 def _load_robots_txt() -> str:
@@ -30,624 +38,150 @@ def _load_robots_txt() -> str:
         return _ROBOTS_TXT_PATH.read_text(encoding="utf-8")
     return _DEFAULT_ROBOTS_TXT
 
-_SEARCH_UI_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>News Search Engine</title>
-  <style>
-    :root {
-      --bg: #f4f6f9;
-      --card: #ffffff;
-      --ink: #17202a;
-      --muted: #566370;
-      --accent: #0b57d0;
-      --accent-soft: #e8f0fe;
-      --border: #dce2ea;
-      --mark: #fff0a0;
-      --success-bg: #e6f4ea;
-      --success-ink: #137333;
-      --warn-bg: #fef7e0;
-      --warn-border: #f6d57a;
-      --code-bg: #0f172a;
-      --code-ink: #e2e8f0;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--ink);
-      line-height: 1.5;
-    }
-    .container { max-width: 1180px; margin: 0 auto; padding: 24px 18px 64px; }
-    header h1 { margin: 0 0 4px; font-size: 1.7rem; }
-    header p { margin: 0 0 12px; color: var(--muted); font-size: 0.95rem; }
-    .coverage-bar {
-      display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
-      padding: 10px 14px; margin-bottom: 18px;
-      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-      font-size: 0.86rem; color: var(--muted);
-    }
-    .coverage-bar strong { color: var(--ink); }
-    .search-panel {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-      margin-bottom: 18px;
-    }
-    .query-row { display: flex; gap: 10px; margin-bottom: 10px; }
-    .query-row input {
-      flex: 1; padding: 10px 12px; font-size: 1rem;
-      border: 1px solid var(--border); border-radius: 8px;
-    }
-    .query-row button {
-      padding: 10px 18px; font-size: 1rem; font-weight: 600;
-      border: 0; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer;
-    }
-    .try-row {
-      display: flex; flex-wrap: wrap; align-items: center; gap: 7px;
-      margin-bottom: 12px; font-size: 0.84rem; color: var(--muted);
-    }
-    .pill {
-      display: inline-flex; align-items: center; gap: 4px;
-      padding: 3px 10px; border-radius: 999px; font-size: 0.8rem;
-      border: 1px solid var(--border); background: #f8fafc; color: var(--ink);
-      cursor: pointer; text-decoration: none;
-    }
-    .pill:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
-    .filters {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      gap: 10px; align-items: end;
-    }
-    .filters label { display: block; font-size: 0.78rem; color: var(--muted); margin-bottom: 3px; }
-    .filters input, .filters select {
-      width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px;
-      font-size: 0.9rem; background: #fff; color: var(--ink);
-    }
-    .controls-footer {
-      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
-      gap: 10px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);
-      font-size: 0.85rem;
-    }
-    .debug-toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-weight: 500; }
-    .reset-btn {
-      padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px;
-      background: #fff; color: var(--muted); cursor: pointer; font-size: 0.82rem;
-    }
-    .reset-btn:hover { color: var(--ink); border-color: var(--muted); }
-    .layout { display: grid; grid-template-columns: 245px minmax(0, 1fr); gap: 18px; align-items: start; }
-    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
-    .sidebar {
-      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-      padding: 14px;
-    }
-    .sidebar h3 {
-      margin: 0 0 8px; font-size: 0.82rem; text-transform: uppercase;
-      letter-spacing: 0.04em; color: var(--muted);
-    }
-    .facet-group { margin-bottom: 16px; }
-    .facet-group:last-child { margin-bottom: 0; }
-    .facet-list { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; }
-    .facet-btn {
-      display: flex; justify-content: space-between; align-items: center; width: 100%;
-      padding: 5px 8px; border: 1px solid transparent; border-radius: 6px;
-      background: transparent; color: var(--ink); font-size: 0.85rem; cursor: pointer; text-align: left;
-    }
-    .facet-btn:hover { background: #f1f5f9; }
-    .facet-btn.active {
-      background: var(--accent-soft); border-color: #b7d0fb; color: #0b57d0; font-weight: 600;
-    }
-    .facet-count { font-size: 0.78rem; color: var(--muted); }
-    .debug-panel {
-      display: none;
-      background: var(--code-bg); color: var(--code-ink);
-      border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.8rem;
-    }
-    .debug-panel.visible { display: block; }
-    .debug-grid { display: grid; grid-template-columns: 165px 1fr; gap: 6px 12px; }
-    .debug-key { color: #94a3b8; }
-    .entity-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
-    .badge {
-      display: inline-flex; align-items: center; gap: 4px;
-      padding: 3px 9px; border-radius: 999px; font-size: 0.77rem;
-      background: #e8eefc; color: #16408b; border: 1px solid #d0dcf8;
-      cursor: pointer;
-    }
-    .badge:hover { background: #d6e3fc; }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-      margin-bottom: 14px;
-    }
-    .card-top {
-      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start;
-      gap: 8px; margin-bottom: 6px;
-    }
-    .card h2 { margin: 0; font-size: 1.15rem; flex: 1; min-width: 220px; }
-    .card h2 a { color: var(--accent); text-decoration: none; }
-    .card h2 a:hover { text-decoration: underline; }
-    .card h2 mark, .snippet mark {
-      background: var(--mark); color: inherit; padding: 0 2px; border-radius: 2px; font-weight: 600;
-    }
-    .score-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-    .score-pill {
-      padding: 3px 9px; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
-      background: #eef2ff; color: #312e81; border: 1px solid #c7d2fe;
-    }
-    .cat-pill {
-      padding: 3px 9px; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
-      background: var(--success-bg); color: var(--success-ink); border: 1px solid #cce8d4;
-    }
-    .meta { font-size: 0.84rem; color: var(--muted); margin-bottom: 8px; }
-    .field-breakdown { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-    .field-chip {
-      padding: 2px 8px; border-radius: 6px; font-size: 0.76rem;
-      background: #f8fafc; color: #334155; border: 1px solid var(--border);
-    }
-    .snippet { margin-bottom: 10px; }
-    .card-entities { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-    .entity-chip {
-      padding: 2px 8px; border-radius: 999px; font-size: 0.75rem;
-      background: #f1f5f9; color: #1e293b; border: 1px solid #cbd5e1; cursor: pointer;
-    }
-    .entity-chip:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
-    .bg-drawer {
-      margin-top: 8px; padding: 8px 12px; border-radius: 8px;
-      background: #f8fafc; border: 1px solid var(--border); font-size: 0.87rem;
-    }
-    .bg-drawer summary { cursor: pointer; font-weight: 600; color: #1e293b; }
-    .bg-list { margin: 8px 0 2px; padding-left: 18px; color: var(--muted); }
-    .bg-list li { margin-bottom: 4px; }
-    .bg-list a { color: var(--accent); text-decoration: none; }
-    .bg-list a:hover { text-decoration: underline; }
-    .empty-state {
-      background: var(--warn-bg); border: 1px solid var(--warn-border);
-      border-radius: 10px; padding: 16px;
-    }
-    .empty-state h3 { margin: 0 0 6px; font-size: 1rem; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <h1>News Search Engine</h1>
-      <p>Multi-field Okapi BM25 ranking with classification, named entity recognition, and background story linking.</p>
-    </header>
 
-    <div id="corpus-stats" class="coverage-bar">Loading corpus statistics...</div>
+def _load_search_ui_html() -> str:
+    if _SEARCH_UI_TEMPLATE_PATH.is_file():
+        return _SEARCH_UI_TEMPLATE_PATH.read_text(encoding="utf-8")
+    return "<!DOCTYPE html><html><head><title>News Search Engine</title></head><body><h1>News Search Engine</h1></body></html>"
 
-    <form class="search-panel" id="search-form">
-      <div class="query-row">
-        <input id="q" name="q" type="search" placeholder="Search news headlines, topics, people, or abbreviations (e.g. ind vs pak u19)..." required />
-        <button type="submit">Search</button>
-      </div>
-      <div class="try-row" id="try-pills">
-        <span>Try:</span>
-      </div>
-      <div class="filters">
-        <div>
-          <label for="category">Category / Kicker</label>
-          <select id="category"><option value="">All Categories</option></select>
-        </div>
-        <div>
-          <label for="source">Source Outlet</label>
-          <select id="source"><option value="">All Sources</option></select>
-        </div>
-        <div>
-          <label for="date_from">From (UTC Date)</label>
-          <input id="date_from" type="date" />
-        </div>
-        <div>
-          <label for="date_to">To (UTC Date)</label>
-          <input id="date_to" type="date" />
-        </div>
-      </div>
-      <div class="controls-footer">
-        <label class="debug-toggle">
-          <input type="checkbox" id="debug-toggle" />
-          Show IR Debug Info
-        </label>
-        <button type="button" id="reset-filters" class="reset-btn">Reset Filters</button>
-      </div>
-    </form>
 
-    <div class="layout">
-      <aside class="sidebar" id="facet-sidebar">
-        <div class="facet-group">
-          <h3>Categories</h3>
-          <div class="facet-list" id="category-facets"><span class="meta">Loading...</span></div>
-        </div>
-        <div class="facet-group">
-          <h3>Sources</h3>
-          <div class="facet-list" id="source-facets"><span class="meta">Loading...</span></div>
-        </div>
-      </aside>
+def _load_default_qrels(
+    service: SearchService,
+    qrels_path: Path = DEFAULT_EVAL_QRELS_PATH,
+) -> list[QueryJudgment]:
+    """Load curated qrels JSON if present and matching the active index; else synthesize from corpus."""
+    active_ids = service.index.indexed_doc_ids
+    if qrels_path.is_file():
+        try:
+            raw = json.loads(qrels_path.read_text(encoding="utf-8"))
+            parsed = [QueryJudgment.model_validate(item) for item in raw]
+            matched = [
+                QueryJudgment(
+                    query_id=j.query_id,
+                    query=j.query,
+                    relevant_docs={
+                        doc_id: grade
+                        for doc_id, grade in j.relevant_docs.items()
+                        if doc_id in active_ids
+                    },
+                )
+                for j in parsed
+            ]
+            matched = [j for j in matched if j.relevant_docs]
+            if matched:
+                return matched
+        except (OSError, ValueError):
+            pass
 
-      <main>
-        <div id="ir-debug-panel" class="debug-panel"></div>
-        <div id="entities" class="entity-bar"></div>
-        <div id="status" class="meta"></div>
-        <div id="results"></div>
-      </main>
-    </div>
-  </div>
+    # Deterministic fallback for isolated test corpora without an external qrels file
+    overview = service.get_corpus_overview()
+    synthesized: list[QueryJudgment] = []
+    for idx, sample_q in enumerate(overview.sample_queries[:5], start=1):
+        hits = service.index.search(sample_q, top_k=3)
+        if not hits:
+            continue
+        rel_docs = {hit.doc_id: (2 if rank == 0 else 1) for rank, hit in enumerate(hits)}
+        synthesized.append(
+            QueryJudgment(query_id=f"auto_q{idx}", query=sample_q, relevant_docs=rel_docs)
+        )
+    return synthesized
 
-  <script>
-    const form = document.getElementById("search-form");
-    const qInput = document.getElementById("q");
-    const categorySelect = document.getElementById("category");
-    const sourceSelect = document.getElementById("source");
-    const dateFromInput = document.getElementById("date_from");
-    const dateToInput = document.getElementById("date_to");
-    const debugToggle = document.getElementById("debug-toggle");
-    const debugPanel = document.getElementById("ir-debug-panel");
-    const resultsEl = document.getElementById("results");
-    const entitiesEl = document.getElementById("entities");
-    const statusEl = document.getElementById("status");
-    const corpusStatsEl = document.getElementById("corpus-stats");
-    const tryPillsEl = document.getElementById("try-pills");
-    const categoryFacetsEl = document.getElementById("category-facets");
-    const sourceFacetsEl = document.getElementById("source-facets");
-    const resetBtn = document.getElementById("reset-filters");
 
-    let lastDebug = null;
-    const FALLBACK_TRY = ["climate summit", "semiconductor", "cricket"];
-
-    function escapeHtml(text) {
-      return String(text ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }
-
-    function safeHttpUrl(url) {
-      try {
-        const parsed = new URL(String(url ?? ""), window.location.origin);
-        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-          return parsed.href;
+def _read_db_stats(db_path: Path, indexed_doc_count: int) -> dict[str, object]:
+    """Return read-only live SQLite frontier & feed statistics."""
+    if not db_path.is_file():
+        return {
+            "db_exists": False,
+            "db_path": str(db_path),
+            "articles_count": 0,
+            "indexed_doc_count": indexed_doc_count,
+            "total_feeds": 0,
+            "active_feeds": 0,
+            "frontier_counts": {},
+            "feeds": [],
         }
-      } catch (_err) {}
-      return "#";
+
+    conn = get_connection(db_path)
+    try:
+        articles_count = int(conn.execute("SELECT COUNT(*) FROM articles;").fetchone()[0])
+        total_feeds = int(conn.execute("SELECT COUNT(*) FROM rss_feeds;").fetchone()[0])
+        active_feeds = int(
+            conn.execute("SELECT COUNT(*) FROM rss_feeds WHERE is_active = 1;").fetchone()[0]
+        )
+        frontier_rows = conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM crawl_frontier GROUP BY status;"
+        ).fetchall()
+        frontier_counts = {str(r["status"]): int(r["cnt"]) for r in frontier_rows}
+        feed_rows = conn.execute(
+            """
+            SELECT f.id, f.name, f.source, f.category, f.is_active, f.last_polled_at,
+                   (SELECT COUNT(*) FROM crawl_frontier cf WHERE cf.feed_id = f.id AND cf.status = 'pending') AS pending,
+                   (SELECT COUNT(*) FROM crawl_frontier cf WHERE cf.feed_id = f.id AND cf.status = 'fetched') AS fetched,
+                   (SELECT COUNT(*) FROM crawl_frontier cf WHERE cf.feed_id = f.id AND cf.status = 'failed') AS failed,
+                   (SELECT COUNT(*) FROM crawl_frontier cf WHERE cf.feed_id = f.id AND cf.status = 'skipped') AS skipped,
+                   (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id) AS articles
+            FROM rss_feeds f
+            ORDER BY articles DESC, f.id ASC;
+            """
+        ).fetchall()
+        feeds = [
+            {
+                "id": int(r["id"]),
+                "name": str(r["name"]),
+                "source": str(r["source"]),
+                "category": str(r["category"]),
+                "is_active": bool(r["is_active"]),
+                "last_polled_at": r["last_polled_at"],
+                "pending": int(r["pending"] or 0),
+                "fetched": int(r["fetched"] or 0),
+                "failed": int(r["failed"] or 0),
+                "skipped": int(r["skipped"] or 0),
+                "articles": int(r["articles"] or 0),
+            }
+            for r in feed_rows
+        ]
+    finally:
+        conn.close()
+
+    return {
+        "db_exists": True,
+        "db_path": str(db_path),
+        "articles_count": articles_count,
+        "indexed_doc_count": indexed_doc_count,
+        "total_feeds": total_feeds,
+        "active_feeds": active_feeds,
+        "frontier_counts": frontier_counts,
+        "feeds": feeds,
     }
-
-    function capitalizeLabel(label) {
-      if (!label) return "General";
-      return label.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-    }
-
-    function formatDateShort(iso) {
-      if (!iso) return "";
-      const d = new Date(iso);
-      if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
-      return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
-    }
-
-    function populateSelect(selectEl, defaultLabel, buckets, currentVal) {
-      const options = [`<option value="">${escapeHtml(defaultLabel)}</option>`];
-      for (const b of buckets) {
-        const selected = b.name === currentVal ? " selected" : "";
-        options.push(`<option value="${escapeHtml(b.name)}"${selected}>${escapeHtml(b.name)} (${b.count})</option>`);
-      }
-      selectEl.innerHTML = options.join("");
-    }
-
-    function renderFacetList(container, buckets, activeVal, selectEl) {
-      if (!buckets.length) {
-        container.innerHTML = `<span class="meta">No facets indexed yet</span>`;
-        return;
-      }
-      const allBtn = `<button type="button" class="facet-btn${!activeVal ? " active" : ""}" data-val=""><span>All</span></button>`;
-      const items = buckets.map(b => {
-        const isActive = b.name === activeVal ? " active" : "";
-        return `<button type="button" class="facet-btn${isActive}" data-val="${escapeHtml(b.name)}"><span>${escapeHtml(b.name)}</span><span class="facet-count">${b.count}</span></button>`;
-      });
-      container.innerHTML = allBtn + items.join("");
-      for (const btn of container.querySelectorAll(".facet-btn")) {
-        btn.addEventListener("click", () => {
-          const val = btn.dataset.val || "";
-          selectEl.value = (val && selectEl.value === val) ? "" : val;
-          if (qInput.value.trim() || hasActiveFilters()) {
-            runSearch();
-          } else {
-            renderOverviewSync();
-            clearToIdle();
-            qInput.focus();
-          }
-        });
-      }
-    }
-
-    function hasActiveFilters() {
-      return Boolean(
-        categorySelect.value.trim()
-        || sourceSelect.value.trim()
-        || dateFromInput.value.trim()
-        || dateToInput.value.trim()
-      );
-    }
-
-    function clearToIdle() {
-      statusEl.textContent = "Enter keywords or select a category, source, or date filter.";
-      resultsEl.innerHTML = "";
-      entitiesEl.innerHTML = "";
-      renderDebugPanel(null);
-    }
-
-    let cachedOverview = null;
-    function renderOverviewSync() {
-      if (!cachedOverview) return;
-      renderOverview(cachedOverview);
-    }
-
-    function renderOverview(overview) {
-      cachedOverview = overview;
-      const windowText = (overview.date_min && overview.date_max)
-        ? `${formatDateShort(overview.date_min)} – ${formatDateShort(overview.date_max)}`
-        : "No dates indexed";
-      corpusStatsEl.innerHTML =
-        `<span><strong>Indexed:</strong> ${overview.doc_count} article(s)</span>` +
-        `<span><strong>Sources:</strong> ${overview.sources.length}</span>` +
-        `<span><strong>Categories:</strong> ${overview.categories.length}</span>` +
-        `<span><strong>Crawl Window (UTC):</strong> ${escapeHtml(windowText)}</span>`;
-
-      if (overview.date_min) dateFromInput.min = overview.date_min.slice(0, 10);
-      if (overview.date_max) dateToInput.max = overview.date_max.slice(0, 10);
-
-      const curCat = categorySelect.value;
-      const curSrc = sourceSelect.value;
-      populateSelect(categorySelect, "All Categories", overview.categories, curCat);
-      populateSelect(sourceSelect, "All Sources", overview.sources, curSrc);
-      renderFacetList(categoryFacetsEl, overview.categories, categorySelect.value, categorySelect);
-      renderFacetList(sourceFacetsEl, overview.sources, sourceSelect.value, sourceSelect);
-
-      const samples = (overview.sample_queries && overview.sample_queries.length)
-        ? overview.sample_queries
-        : FALLBACK_TRY;
-      tryPillsEl.innerHTML = `<span>Try:</span>` + samples.map(q =>
-        `<button type="button" class="pill try-pill" data-query="${escapeHtml(q)}">${escapeHtml(q)}</button>`
-      ).join("");
-      for (const pill of tryPillsEl.querySelectorAll(".try-pill")) {
-        pill.addEventListener("click", () => {
-          qInput.value = pill.dataset.query || "";
-          runSearch();
-        });
-      }
-    }
-
-    function renderDebugPanel(debug) {
-      lastDebug = debug;
-      if (!debugToggle.checked || !debug) {
-        debugPanel.classList.remove("visible");
-        debugPanel.innerHTML = "";
-        return;
-      }
-      const expansions = Object.entries(debug.expanded_terms || {})
-        .map(([k, v]) => `${k} -> [${v.join(", ")}]`)
-        .join("; ") || "none";
-      const weights = Object.entries(debug.field_weights || {})
-        .map(([f, w]) => `${f}: ${w}x`)
-        .join(" · ");
-      debugPanel.classList.add("visible");
-      debugPanel.innerHTML = `
-        <div class="debug-grid">
-          <div class="debug-key">Execution Time:</div><div>${debug.execution_time_ms.toFixed(2)} ms</div>
-          <div class="debug-key">Raw Tokens:</div><div>[${escapeHtml((debug.raw_tokens || []).join(", "))}]</div>
-          <div class="debug-key">Stopwords Removed:</div><div>[${escapeHtml((debug.removed_stopwords || []).join(", ")) || "none"}]</div>
-          <div class="debug-key">Porter Stems:</div><div>[${escapeHtml((debug.stemmed_tokens || []).join(", "))}]</div>
-          <div class="debug-key">Expanded Terms:</div><div>${escapeHtml(expansions)}</div>
-          <div class="debug-key">Final BM25 Terms:</div><div>[${escapeHtml((debug.final_terms || []).join(", "))}]</div>
-          <div class="debug-key">Field Weights:</div><div>${escapeHtml(weights)}</div>
-        </div>`;
-    }
-
-    function triggerQuery(queryText) {
-      qInput.value = queryText;
-      runSearch();
-    }
-
-    function renderBackgroundList(links) {
-      if (!links || !links.length) {
-        return `<p class="meta" style="margin:6px 0 0;">No related background stories found in current index.</p>`;
-      }
-      const items = links.map(l => {
-        const shared = l.shared_entities && l.shared_entities.length
-          ? ` — Shared: ${escapeHtml(l.shared_entities.join(", "))}`
-          : "";
-        return `<li><a href="${escapeHtml(safeHttpUrl(l.canonical_url))}" target="_blank" rel="noopener noreferrer">${escapeHtml(l.title)}</a>` +
-          ` (${escapeHtml(l.source || "Unknown")}${l.published_date ? ", " + escapeHtml(formatDateShort(l.published_date)) : ""} · sim ${Number(l.similarity_score).toFixed(2)}${shared})</li>`;
-      }).join("");
-      return `<ul class="bg-list">${items}</ul>`;
-    }
-
-    async function runSearch() {
-      const qVal = qInput.value.trim();
-      if (!qVal && !hasActiveFilters()) {
-        clearToIdle();
-        return;
-      }
-
-      const params = new URLSearchParams();
-      if (qVal) params.set("q", qVal);
-      for (const [key, el] of [
-        ["category", categorySelect],
-        ["source", sourceSelect],
-        ["date_from", dateFromInput],
-        ["date_to", dateToInput],
-      ]) {
-        const val = el.value.trim();
-        if (val) params.set(key, val);
-      }
-
-      statusEl.textContent = "Searching...";
-      let res;
-      let data = {};
-      try {
-        res = await fetch(`/api/search?${params.toString()}`);
-        try {
-          data = await res.json();
-        } catch (_parseErr) {
-          data = {};
-        }
-      } catch (_netErr) {
-        statusEl.textContent = "Network error while contacting search API.";
-        resultsEl.innerHTML = "";
-        return;
-      }
-
-      if (!res.ok) {
-        statusEl.textContent = data.detail || `Search error (HTTP ${res.status})`;
-        resultsEl.innerHTML = "";
-        return;
-      }
-
-      if (data.facets) renderOverview(data.facets);
-      renderDebugPanel(data.query_debug);
-
-      const execTime = data.query_debug ? ` in ${data.query_debug.execution_time_ms.toFixed(1)} ms` : "";
-      statusEl.textContent = data.query.trim()
-        ? `${data.total_hits} result(s) for "${data.query}"${execTime}`
-        : `Showing ${data.total_hits} filtered article(s)${execTime}`;
-
-      entitiesEl.innerHTML = data.top_entities.map(ent =>
-        `<button type="button" class="badge entity-trigger" data-entity="${escapeHtml(ent.text)}">${escapeHtml(ent.label)}: ${escapeHtml(ent.text)} (${ent.count})</button>`
-      ).join("");
-
-      if (!data.results.length) {
-        const retryTarget = data.query.trim() ? ` &amp; retry "${escapeHtml(data.query)}"` : "";
-        const filterHint = (data.unfiltered_total_hits && data.unfiltered_total_hits > 0)
-          ? `<p>Active filters hid <strong>${data.unfiltered_total_hits}</strong> matching article(s). <button type="button" class="pill" id="clear-retry-btn">Clear filters${retryTarget}</button></p>`
-          : `<p>No documents matched all terms. Try broadening abbreviations, clearing date filters, or picking a sample query below:</p>`;
-        const sugPills = (data.suggestions || []).map(s =>
-          `<button type="button" class="pill sug-pill" data-query="${escapeHtml(s)}">${escapeHtml(s)}</button>`
-        ).join(" ");
-        resultsEl.innerHTML = `<div class="empty-state"><h3>No matching results found</h3>${filterHint}<div class="try-row">${sugPills}</div></div>`;
-        const clearRetry = document.getElementById("clear-retry-btn");
-        if (clearRetry) {
-          clearRetry.addEventListener("click", () => {
-            categorySelect.value = "";
-            sourceSelect.value = "";
-            dateFromInput.value = "";
-            dateToInput.value = "";
-            runSearch();
-          });
-        }
-        for (const p of resultsEl.querySelectorAll(".sug-pill")) {
-          p.addEventListener("click", () => triggerQuery(p.dataset.query || ""));
-        }
-        return;
-      }
-
-      resultsEl.innerHTML = data.results.map(item => {
-        const titleHtml = item.highlighted_title || escapeHtml(item.title);
-        const catConf = `${escapeHtml(capitalizeLabel(item.predicted_category))} · ${Math.round(Number(item.category_confidence) * 100)}%`;
-        const fieldChips = (item.field_matches || []).map(fm =>
-          `<span class="field-chip">${escapeHtml(fm.label)} (${Number(fm.weight).toFixed(1)}x: +${Number(fm.score).toFixed(2)})</span>`
-        ).join("");
-        const entChips = (item.entities || []).map(ent =>
-          `<button type="button" class="entity-chip entity-trigger" data-entity="${escapeHtml(ent.text)}">${escapeHtml(ent.label)}: ${escapeHtml(ent.text)}</button>`
-        ).join("");
-        const bgCount = (item.background_links || []).length;
-        return `
-          <article class="card">
-            <div class="card-top">
-              <h2><a href="${escapeHtml(safeHttpUrl(item.canonical_url))}" target="_blank" rel="noopener noreferrer">${titleHtml}</a></h2>
-              <div class="score-group">
-                <span class="cat-pill">${catConf}</span>
-                <span class="score-pill">${data.query.trim() ? `Score: ${Number(item.score).toFixed(2)}` : "Filter match"}</span>
-              </div>
-            </div>
-            <div class="meta">
-              ${escapeHtml(item.source || "Unknown Source")}
-              ${item.kicker ? " · Kicker: " + escapeHtml(item.kicker) : ""}
-              ${item.author ? " · By " + escapeHtml(item.author) : ""}
-              ${item.published_date ? " · " + escapeHtml(formatDateShort(item.published_date)) : ""}
-            </div>
-            <div class="field-breakdown">${fieldChips}</div>
-            <div class="snippet">${item.snippet}</div>
-            ${entChips ? `<div class="card-entities">${entChips}</div>` : ""}
-            <details class="bg-drawer">
-              <summary>Related / Background Stories (${bgCount})</summary>
-              ${renderBackgroundList(item.background_links)}
-            </details>
-          </article>`;
-      }).join("");
-
-      for (const trigger of document.querySelectorAll(".entity-trigger")) {
-        trigger.addEventListener("click", () => triggerQuery(trigger.dataset.entity || ""));
-      }
-    }
-
-    form.addEventListener("submit", (e) => {
-      e.preventDefault();
-      runSearch();
-    });
-
-    for (const el of [categorySelect, sourceSelect, dateFromInput, dateToInput]) {
-      el.addEventListener("change", () => {
-        if (qInput.value.trim() || hasActiveFilters()) runSearch();
-        else {
-          renderOverviewSync();
-          clearToIdle();
-        }
-      });
-    }
-
-    debugToggle.addEventListener("change", () => renderDebugPanel(lastDebug));
-
-    resetBtn.addEventListener("click", () => {
-      categorySelect.value = "";
-      sourceSelect.value = "";
-      dateFromInput.value = "";
-      dateToInput.value = "";
-      renderOverviewSync();
-      if (qInput.value.trim()) runSearch();
-      else clearToIdle();
-    });
-
-    (async () => {
-      try {
-        const res = await fetch("/api/corpus");
-        if (res.ok) {
-          renderOverview(await res.json());
-        }
-      } catch (_err) {
-        corpusStatsEl.textContent = "Corpus statistics unavailable.";
-      }
-    })();
-  </script>
-</body>
-</html>
-"""
 
 
 def create_app(
     index_dir: Path | str = DEFAULT_INDEX_DIR,
     *,
     index: BM25Index | None = None,
+    db_path: Path | str = DEFAULT_DB_PATH,
+    metrics_path: Path | str = DEFAULT_METRICS_PATH,
+    qrels_path: Path | str = DEFAULT_EVAL_QRELS_PATH,
 ) -> FastAPI:
-    """Create a configured FastAPI application for news search and evaluation."""
+    """Create a configured FastAPI application for news search, classification, and evaluation."""
     resolved_index = index if index is not None else BM25Index(index_dir)
     service = SearchService(resolved_index)
+    resolved_db_path = Path(db_path)
+    resolved_metrics_path = Path(metrics_path)
+    resolved_qrels_path = Path(qrels_path)
+    live_retriever = LiveQueryRetriever(service, db_path=resolved_db_path)
 
     application = FastAPI(
         title="News Crawler & Search Engine API",
-        version="0.1.0",
-        description="Multi-field Okapi BM25 search with classification, NER, and background story linking.",
+        version="0.2.0",
+        description="Multi-field Okapi BM25 search with supervised ML classification, NER, and TF-IDF background linking.",
     )
     application.state.search_service = service
+    application.state.live_retriever = live_retriever
 
     @application.get("/", response_class=HTMLResponse)
     def search_ui() -> HTMLResponse:
-        return HTMLResponse(content=_SEARCH_UI_HTML)
+        return HTMLResponse(content=_load_search_ui_html())
 
     @application.get("/robots.txt", response_class=PlainTextResponse)
     def robots_txt() -> PlainTextResponse:
@@ -666,6 +200,18 @@ def create_app(
     def get_corpus() -> CorpusOverview:
         return service.get_corpus_overview()
 
+    @application.get("/api/stats")
+    def get_stats() -> dict[str, object]:
+        service.index.refresh_if_changed()
+        return _read_db_stats(resolved_db_path, service.index.doc_count)
+
+    @application.get("/api/classifier/metrics")
+    def get_classifier_metrics() -> dict[str, object]:
+        metrics = load_classifier_metrics(resolved_metrics_path)
+        if metrics is None:
+            return {"trained": False, "model_type": "lexical_fallback"}
+        return {"trained": True, **metrics}
+
     @application.get("/api/search", response_model=SearchResponse)
     def search_articles(
         q: Annotated[
@@ -673,8 +219,12 @@ def create_app(
             Query(description="Keyword search query (optional when filters are active)"),
         ] = "",
         k: Annotated[int, Query(ge=1, le=100, description="Maximum number of results")] = 10,
-        category: Annotated[str | None, Query(description="Filter by kicker/category")] = None,
+        category: Annotated[str | None, Query(description="Filter by category")] = None,
         source: Annotated[str | None, Query(description="Filter by publisher source name")] = None,
+        sort: Annotated[
+            str,
+            Query(description="Sort mode: 'relevance' (BM25 + recency) or 'latest' (UTC newest)"),
+        ] = "relevance",
         date_from: Annotated[
             str | None, Query(description="Inclusive start UTC date/ISO timestamp")
         ] = None,
@@ -709,6 +259,127 @@ def create_app(
             source=source,
             date_from=start_dt,
             date_to=end_dt,
+            sort=sort,
+        )
+
+    @application.post("/api/crawl-for-query")
+    async def crawl_for_query(
+        q: Annotated[str, Query(min_length=1, description="News query to crawl fresh links for")],
+        k: Annotated[int, Query(ge=1, le=100)] = 10,
+        max_crawl: Annotated[int, Query(ge=1, le=15)] = 8,
+        force_poll: Annotated[bool, Query()] = False,
+        enable_discovery: Annotated[bool, Query()] = True,
+        category: Annotated[str | None, Query()] = None,
+        source: Annotated[str | None, Query()] = None,
+        sort: Annotated[str, Query()] = "relevance",
+        date_from: Annotated[str | None, Query()] = None,
+        date_to: Annotated[str | None, Query()] = None,
+    ) -> dict[str, object]:
+        if not q.strip():
+            raise HTTPException(status_code=422, detail="Query string 'q' must not be blank.")
+        try:
+            start_dt = parse_date_boundary(date_from, end_of_day=False)
+            end_dt = parse_date_boundary(date_to, end_of_day=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid date filter: {exc}") from exc
+
+        crawl_summary = await live_retriever.retrieve_for_query(
+            q,
+            max_crawl=max_crawl,
+            force_poll=force_poll,
+            enable_discovery=enable_discovery,
+        )
+        search_resp = service.search(
+            q,
+            top_k=k,
+            category=category,
+            source=source,
+            date_from=start_dt,
+            date_to=end_dt,
+            sort=sort,
+        )
+        return {
+            "crawl_summary": crawl_summary,
+            "search_response": search_resp.model_dump(mode="json"),
+        }
+
+    @application.get("/api/search/live")
+    async def search_live_stream(
+        q: Annotated[str, Query(min_length=1, description="News query for live retrieval")],
+        k: Annotated[int, Query(ge=1, le=100)] = 10,
+        max_crawl: Annotated[int, Query(ge=1, le=15)] = 8,
+        force_poll: Annotated[bool, Query()] = False,
+        enable_discovery: Annotated[bool, Query()] = True,
+        category: Annotated[str | None, Query()] = None,
+        source: Annotated[str | None, Query()] = None,
+        sort: Annotated[str, Query()] = "relevance",
+        date_from: Annotated[str | None, Query()] = None,
+        date_to: Annotated[str | None, Query()] = None,
+    ) -> StreamingResponse:
+        if not q.strip():
+            raise HTTPException(status_code=422, detail="Query string 'q' must not be blank.")
+        try:
+            start_dt = parse_date_boundary(date_from, end_of_day=False)
+            end_dt = parse_date_boundary(date_to, end_of_day=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid date filter: {exc}") from exc
+
+        async def _event_stream() -> AsyncIterator[str]:
+            queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
+
+            async def _on_progress(event: dict[str, object]) -> None:
+                await queue.put(event)
+
+            async def _worker() -> None:
+                try:
+                    summary = await live_retriever.retrieve_for_query(
+                        q,
+                        max_crawl=max_crawl,
+                        force_poll=force_poll,
+                        enable_discovery=enable_discovery,
+                        progress_cb=_on_progress,
+                    )
+                    search_resp = service.search(
+                        q,
+                        top_k=k,
+                        category=category,
+                        source=source,
+                        date_from=start_dt,
+                        date_to=end_dt,
+                        sort=sort,
+                    )
+                    await queue.put(
+                        {
+                            "stage": "complete",
+                            "message": (
+                                f"Added {summary['newly_indexed']} fresh article(s) to index."
+                                if int(summary["newly_indexed"]) > 0
+                                else "Up to date with registered news feeds."
+                            ),
+                            "crawl_summary": summary,
+                            "search_response": search_resp.model_dump(mode="json"),
+                        }
+                    )
+                except Exception as exc:
+                    await queue.put({"stage": "error", "message": f"Live crawl error: {exc}"})
+                finally:
+                    await queue.put(None)
+
+            task = asyncio.create_task(_worker())
+            try:
+                while True:
+                    event = await queue.get()
+                    if event is None:
+                        break
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            finally:
+                if not task.done():
+                    task.cancel()
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @application.get("/api/articles/{doc_id}", response_model=ArticleDetailResponse)
@@ -736,6 +407,13 @@ def create_app(
         judgments: list[QueryJudgment],
         k: Annotated[int, Query(ge=1, le=100)] = 10,
     ) -> EvaluationReport:
+        return service.evaluate(judgments, k=k)
+
+    @application.get("/api/evaluate/default", response_model=EvaluationReport)
+    def evaluate_default_queries(
+        k: Annotated[int, Query(ge=1, le=100)] = 10,
+    ) -> EvaluationReport:
+        judgments = _load_default_qrels(service, resolved_qrels_path)
         return service.evaluate(judgments, k=k)
 
     return application

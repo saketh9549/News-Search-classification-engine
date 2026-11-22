@@ -227,10 +227,15 @@ def test_fastapi_routes_search_filters_ui_and_evaluation(tmp_path: Path) -> None
         "/robots.txt",
         "/health",
         "/api/corpus",
+        "/api/stats",
+        "/api/classifier/metrics",
         "/api/search",
+        "/api/search/live",
+        "/api/crawl-for-query",
         "/api/articles/{doc_id}",
         "/api/articles/{doc_id}/background",
         "/api/evaluate",
+        "/api/evaluate/default",
     }
 
     endpoints = {
@@ -727,6 +732,354 @@ def test_filter_browse_mode_index_auto_refresh_and_url_cleanup(tmp_path: Path) -
     assert corpus.doc_count == 2
     assert {c.name for c in corpus.categories} == {"sport", "science"}
     assert {s.name for s in corpus.sources} == {"The Hindu", "The Guardian"}
+
+
+def test_ml_classifier_phrase_boost_spell_correction_sort_and_publisher_ner_filter(
+    tmp_path: Path,
+) -> None:
+    """Verify ML classifier CV/persistence, phrase proximity, spell correction, sort, and publisher ORG filter."""
+    from src.search.classifier import NewsCategoryClassifier
+
+    # 1. Supervised ML classifier training, CV evaluation, persistence, and reload
+    samples = [
+        (f"Cricket World Cup Match {i}", f"Bowlers took wickets and batsmen scored a century in the stadium match {i}.", "sport")
+        for i in range(6)
+    ] + [
+        (f"Semiconductor AI Chip Launch {i}", f"Software engineers built cloud GPU silicon hardware and neural models {i}.", "technology")
+        for i in range(6)
+    ] + [
+        (f"Central Bank Inflation GDP Report {i}", f"Stock market investors reacted to quarterly revenue, banking tariffs, and earnings {i}.", "business")
+        for i in range(6)
+    ]
+    clf = NewsCategoryClassifier.train_from_samples(samples, min_samples_per_class=4)
+    assert clf.metrics["num_classes"] == 3
+    assert clf.metrics["accuracy"] >= 0.8
+    assert clf.metrics["macro_f1"] >= 0.8
+    assert len(clf.metrics["confusion_matrix"]) == 3
+
+    model_path = tmp_path / "clf.joblib"
+    metrics_path = tmp_path / "clf_metrics.json"
+    clf.save(model_path=model_path, metrics_path=metrics_path)
+    reloaded = NewsCategoryClassifier.load(model_path=model_path, metrics_path=metrics_path)
+    assert reloaded is not None
+    pred_cat, pred_conf = reloaded.predict(
+        "New Silicon AI Processor Released",
+        "Cloud hardware firms ordered GPU chips for neural software models.",
+    )
+    assert pred_cat == "technology"
+    assert 0.3 <= pred_conf <= 1.0
+
+    # 2. Phrase proximity, quoted phrase filter, typo spell correction, latest sort, and publisher ORG filtering
+    idx = BM25Index(tmp_path / "idx_v2")
+    a_phrase = _article(
+        url="https://example.com/world-cup-final",
+        title="World Cup Final Thriller Delights Stadium Crowd",
+        kicker="sport",
+        feed_id=6,
+        published_date=datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc),
+        body_text=(
+            "Fans gathered across London for the World Cup championship match. "
+            "BBC and Reuters reported Nvidia sponsored broadcast analytics."
+        ),
+    )
+    a_scattered = _article(
+        url="https://example.com/weather-world-coffee-cup",
+        title="Global Weather Shifts Around the World",
+        kicker="world",
+        feed_id=1,
+        published_date=datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc),
+        body_text=(
+            "Extreme weather affected cities around the world while farmers held a cup of coffee. "
+            "BBC and Getty Images documented the climate storm."
+        ),
+    )
+    idx.index_articles([a_phrase, a_scattered], source_by_feed_id={1: "BBC News", 6: "The Hindu"})
+    svc = SearchService(idx)
+
+    # Exact adjacent phrase "World Cup" must rank #1 and quoted query filters out scattered match
+    unquoted = svc.search("World Cup")
+    assert unquoted.results[0].doc_id == a_phrase.doc_id
+    quoted = svc.search('"World Cup"')
+    assert [r.doc_id for r in quoted.results] == [a_phrase.doc_id]
+
+    # Typo spell correction ("nvida" -> "nvidia")
+    typo_resp = svc.search("nvida")
+    assert typo_resp.total_hits == 0
+    assert typo_resp.did_you_mean == "nvidia"
+
+    # Sort by latest puts newer doc first
+    latest_resp = svc.search("world", sort="latest")
+    assert [r.doc_id for r in latest_resp.results] == [a_scattered.doc_id, a_phrase.doc_id]
+
+    # Publisher/wire-agency ORGs (BBC, Reuters, Getty Images) must NEVER be emitted as ORG entities
+    ents = extract_entities(a_phrase.body_text)
+    ent_names_lower = {e.text.lower() for e in ents}
+    assert "nvidia" in ent_names_lower
+    assert "bbc" not in ent_names_lower
+    assert "reuters" not in ent_names_lower
+    assert "getty images" not in ent_names_lower
+
+    # Unrelated stories sharing only BBC must NOT link as background stories
+    links = svc.get_background_links(a_phrase.doc_id, limit=3) or []
+    assert all(l.doc_id != a_scattered.doc_id for l in links)
+
+    # New API endpoints work cleanly
+    app = create_app(
+        index=idx,
+        db_path=tmp_path / "nonexistent.db",
+        metrics_path=metrics_path,
+        qrels_path=tmp_path / "nonexistent_qrels.json",
+    )
+    endpoints = {r.path: r.endpoint for r in app.routes if isinstance(r, APIRoute)}
+    stats_payload = endpoints["/api/stats"]()
+    assert stats_payload["indexed_doc_count"] == 2
+    clf_payload = endpoints["/api/classifier/metrics"]()
+    assert clf_payload["trained"] is True
+    assert clf_payload["accuracy"] >= 0.8
+    eval_payload = endpoints["/api/evaluate/default"](k=5)
+    assert eval_payload.num_queries >= 1
+
+
+def test_query_driven_live_retrieval_from_rss_and_frontier(tmp_path: Path) -> None:
+    """Verify query-driven live retrieval polls RSS, matches pending links, politely crawls, and indexes."""
+    import asyncio
+
+    import httpx
+    import respx
+
+    from src.search.live_retriever import LiveQueryRetriever
+    from src.storage.init_db import get_connection, init_db
+    from src.storage.repository import find_matching_pending_frontier_items
+
+    db_path = tmp_path / "live_query.db"
+    idx_dir = tmp_path / "live_index"
+    init_db(db_path)
+
+    # Keep only BBC World active in this isolated test DB
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute("UPDATE rss_feeds SET is_active = CASE WHEN id = 1 THEN 1 ELSE 0 END;")
+        feed_url = conn.execute("SELECT url FROM rss_feeds WHERE id = 1;").fetchone()["url"]
+    finally:
+        conn.close()
+
+    rss_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>BBC World</title>
+    <item>
+      <title>Quantum Battery Breakthrough Announced in Tokyo</title>
+      <link>https://www.bbc.co.uk/news/articles/quantum-battery-tokyo</link>
+      <guid>bbc-qb-1</guid>
+      <description>Physicists unveil rapid-charging solid-state quantum battery prototype.</description>
+      <pubDate>Sun, 22 Nov 2026 06:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Local Gardening Fair Draws Visitors</title>
+      <link>https://www.bbc.co.uk/news/articles/local-gardening-fair</link>
+      <guid>bbc-garden-2</guid>
+      <description>Community flower show opened over the weekend.</description>
+      <pubDate>Sun, 22 Nov 2026 05:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>
+"""
+    long_article_body = " ".join(
+        [
+            "Physicists in Tokyo announced a quantum battery breakthrough enabling rapid solid-state "
+            "energy storage for electric aviation and renewable grid balancing across Asia and Europe. "
+            "Independent laboratory benchmarks confirmed stable charge cycles, thermal resilience, "
+            "and commercial pilot production schedules beginning early next year."
+        ]
+        * 3
+    )
+    article_html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>Quantum Battery Breakthrough Announced in Tokyo - BBC News</title>
+  <meta property="og:title" content="Quantum Battery Breakthrough Announced in Tokyo" />
+  <meta property="article:published_time" content="2026-11-22T06:00:00Z" />
+  <meta name="author" content="Kenji Sato" />
+</head>
+<body>
+  <article>
+    <h1>Quantum Battery Breakthrough Announced in Tokyo</h1>
+    <p>{long_article_body}</p>
+  </article>
+</body>
+</html>"""
+
+    index = BM25Index(idx_dir)
+    service = SearchService(index)
+    assert service.search("quantum battery").total_hits == 0
+
+    retriever = LiveQueryRetriever(service, db_path=db_path, min_domain_delay=5.0)
+    mono = [500.0]
+    sleeps: list[float] = []
+    stages: list[str] = []
+
+    async def fake_asleep(sec: float) -> None:
+        sleeps.append(sec)
+        mono[0] += sec
+
+    async def on_progress(evt: dict[str, object]) -> None:
+        stages.append(str(evt["stage"]))
+
+    with respx.mock(assert_all_called=False) as mock_http:
+        mock_http.get(feed_url).mock(return_value=httpx.Response(200, content=rss_xml))
+        mock_http.get("https://www.bbc.co.uk/robots.txt").mock(
+            return_value=httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        )
+        matching_route = mock_http.get("https://www.bbc.co.uk/news/articles/quantum-battery-tokyo").mock(
+            return_value=httpx.Response(200, text=article_html, headers={"content-type": "text/html"})
+        )
+        unrelated_route = mock_http.get("https://www.bbc.co.uk/news/articles/local-gardening-fair").mock(
+            return_value=httpx.Response(200, text="<html><body>unused</body></html>", headers={"content-type": "text/html"})
+        )
+
+        async def _run() -> dict[str, object]:
+            async with httpx.AsyncClient() as client:
+                return await retriever.retrieve_for_query(
+                    "quantum battery",
+                    max_crawl=4,
+                    force_poll=True,
+                    enable_discovery=False,
+                    client=client,
+                    sleep_fn=fake_asleep,
+                    monotonic_fn=lambda: mono[0],
+                    progress_cb=on_progress,
+                )
+
+        summary = asyncio.run(_run())
+
+    # Only the query-matching URL was crawled; unrelated RSS item remained untouched in pending queue!
+    assert matching_route.call_count == 1
+    assert unrelated_route.call_count == 0
+    assert summary["feeds_polled"] == 1
+    assert summary["rss_new_links"] == 2
+    assert summary["matched_pending"] == 1
+    assert summary["extracted_persisted"] == 1
+    assert summary["newly_indexed"] == 1
+    assert any(s >= 5.0 - 1e-6 for s in sleeps)
+    assert "polling" in stages and "crawling" in stages and "indexing" in stages
+
+    # Immediate search now returns the freshly crawled & permanently indexed article
+    after = service.search("quantum battery")
+    assert after.total_hits == 1
+    assert after.results[0].title == "Quantum Battery Breakthrough Announced in Tokyo"
+
+    # Unrelated gardening item still lives in pending frontier and matches a "gardening" query!
+    conn = get_connection(db_path)
+    try:
+        garden_matches = find_matching_pending_frontier_items(conn, "gardening fair", limit=5)
+        assert len(garden_matches) == 1
+        assert garden_matches[0].rss_title == "Local Gardening Fair Draws Visitors"
+    finally:
+        conn.close()
+
+
+def test_ner_gazetteer_financial_tech_orgs_and_byline_exclusion(tmp_path: Path) -> None:
+    prose = (
+        "Updated - November 20, 2026 09:29 am IST - Chennai\n"
+        "By Balasubramanyam C.P.\n"
+        "Reporting by Rachel Clun\n"
+        "Morgan Stanley and Charles Schwab advised on the listing while Hugging Face "
+        "released open weights alongside Tata Sons.\n"
+        "Philanthropic funder Coefficient Giving backed safety research, CEO Dario Amodei said."
+    )
+    direct = extract_entities(prose, author=None, exclude_authors="Balasubramanyam C.P.", strip_bylines=True, max_entities=20)
+    by_label = {(e.text, e.label) for e in direct}
+    persons = {e.text for e in direct if e.label == EntityLabel.PERSON}
+
+    for org_name in ("Morgan Stanley", "Charles Schwab", "Hugging Face", "Coefficient Giving", "Tata Sons"):
+        assert (org_name, EntityLabel.ORG) in by_label
+        assert org_name not in persons
+
+    assert "Balasubramanyam C.P" not in persons
+    assert "Rachel Clun" not in persons
+    assert "Dario Amodei" in persons
+
+    # SearchService must also keep journalist metadata bylines out of card entity chips
+    art = _article(
+        url="https://example.com/anthropic-ipo-org-test",
+        title="Anthropic raises $81 billion in IPO",
+        kicker="business",
+        author="Balasubramanyam C.P.",
+        body_text=prose,
+    )
+    idx = BM25Index(tmp_path / "ner_idx")
+    idx.index_articles([art], source_by_feed_id={1: "The Hindu"})
+    svc = SearchService(idx)
+    resp = svc.search("Anthropic Morgan Stanley")
+    assert resp.total_hits == 1
+    card_entities = {(e.text, e.label) for e in resp.results[0].entities}
+    card_persons = {e.text for e in resp.results[0].entities if e.label == EntityLabel.PERSON}
+    assert ("Morgan Stanley", EntityLabel.ORG) in card_entities
+    assert "Balasubramanyam C.P" not in card_persons
+    assert "Balasubramanyam C.P." not in card_persons
+
+
+def test_borderline_classifier_returns_top2_categories(tmp_path: Path) -> None:
+    from src.search.classifier import filter_borderline_secondary, predict_category_top2
+
+    # High-confidence prediction suppresses secondary category
+    assert filter_borderline_secondary(0.72, "technology", 0.21) == (None, None)
+    # Borderline (< 0.50) with substantial runner-up (>= 0.15) keeps secondary category
+    assert filter_borderline_secondary(0.37, "business", 0.34) == ("business", 0.34)
+    # Borderline (< 0.50) with tiny noise runner-up (< 0.15) suppresses secondary category
+    assert filter_borderline_secondary(0.42, "world", 0.08) == (None, None)
+
+    # Lexical borderline test on an IPO / AI crossover article
+    cat1, conf1, cat2, conf2 = predict_category_top2(
+        "Going public on AI software IPO",
+        "AI software chips startup filed an IPO on public stock markets attracting investors.",
+        use_ml=False,
+    )
+    assert cat1 in {"technology", "business"}
+    if conf1 < 0.50:
+        assert cat2 in {"technology", "business"}
+        assert cat2 != cat1
+        assert conf2 is not None and conf2 >= 0.15
+
+    # End-to-end persistence of borderline secondary_category through BM25Index -> SearchService
+    art = _article(
+        url="https://example.com/borderline-ipo",
+        title="Going public on AI: On Anthropic IPO",
+        kicker="opinion",
+        author="Editorial Desk",
+        body_text="The Initial Public Offering (IPO) of Anthropic, PBC marks a milestone for AI technology and stock markets.",
+    )
+    idx = BM25Index(tmp_path / "borderline_idx")
+    idx.index_articles(
+        [art],
+        source_by_feed_id={1: "The Hindu"},
+        predicted_categories={art.doc_id: ("technology", 0.3713, "business", 0.3379)},
+    )
+    svc = SearchService(idx)
+    resp = svc.search("Anthropic IPO")
+    assert resp.total_hits == 1
+    hit = resp.results[0]
+    assert hit.predicted_category == "technology"
+    assert hit.category_confidence == 0.3713
+    assert hit.secondary_category == "business"
+    assert hit.secondary_confidence == 0.3379
+
+
+def test_snippet_normalization_cleans_datelines_and_punctuation_spacing() -> None:
+    body = (
+        "Updated - November 21, 2026 11:17 am IST - Chennai\n\n"
+        "The Initial Public Offering ( IPO ) of Anthropic , PBC , , is a mile marker in AI , . | Photo Credit: Reuters\n\n"
+        "Security officers inspected a .303 rifle near the venue ."
+    )
+    snippet = build_highlighted_snippet(body, "Anthropic IPO", max_chars=260)
+    assert "Updated -" not in snippet
+    assert "Photo Credit" not in snippet
+    assert "(<mark>IPO</mark>) of <mark>Anthropic</mark>, PBC, is a mile marker in AI." in snippet
+    assert "a .303 rifle near the venue." in snippet
+
+
+
 
 
 

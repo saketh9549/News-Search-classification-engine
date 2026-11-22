@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     )
     from src.storage.repository import (
         enqueue_frontier_items,
+        find_matching_pending_frontier_items,
         get_active_feeds,
         get_article_by_doc_id,
         get_due_frontier_items,
@@ -33,6 +34,7 @@ _INIT_EXPORTS = {
 }
 _REPO_EXPORTS = {
     "enqueue_frontier_items",
+    "find_matching_pending_frontier_items",
     "get_active_feeds",
     "get_article_by_doc_id",
     "get_due_frontier_items",

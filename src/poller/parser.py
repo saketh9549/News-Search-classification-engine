@@ -104,18 +104,31 @@ def _extract_guid(entry: dict[str, object], fallback_url: str) -> str:
 
 
 _NON_ARTICLE_PATH_RE = re.compile(
-    r"/(?:iplayer|sounds|news/videos|video|news/av|av|programmes|live)(?:/|$)",
+    r"/(?:iplayer|sounds|podcasts?|audio|news/videos|videos?|news/av|av|"
+    r"programmes?|live|live-updates|liveblog|gallery|photos?|photo-gallery|"
+    r"web-stories|visualstories|anchor)(?:/|$)",
+    re.IGNORECASE,
+)
+_NON_ARTICLE_TITLE_RE = re.compile(
+    r"(?:^(?:watch|listen|video|podcast)\s*:|\s-\s*bbc\s+sounds$)",
     re.IGNORECASE,
 )
 _NON_ENGLISH_ARTICLE_HOSTS: frozenset[str] = frozenset({"aajtak.in", "www.aajtak.in"})
 
 
 def is_article_url(url: str) -> bool:
-    """Return False for non-article multimedia/iPlayer/live or non-English companion feed URLs."""
+    """Return False for non-article multimedia/iPlayer/podcast/live or non-English companion feed URLs."""
     parsed = urlparse(url.strip())
     if (parsed.hostname or "").lower() in _NON_ENGLISH_ARTICLE_HOSTS:
         return False
     return not bool(_NON_ARTICLE_PATH_RE.search(parsed.path or ""))
+
+
+def is_article_title(title: str | None) -> bool:
+    """Return False for video/audio/podcast clip titles that are not text news articles."""
+    if not title:
+        return True
+    return not bool(_NON_ARTICLE_TITLE_RE.search(title.strip()))
 
 
 def parse_feed_xml(raw_bytes: bytes) -> FeedParseOutcome:
@@ -138,6 +151,11 @@ def parse_feed_xml(raw_bytes: bytes) -> FeedParseOutcome:
             domain = extract_domain(normalized_link)
             if not is_article_url(normalized_link):
                 logger.info("Skipping non-article feed entry #%d (%s)", idx, normalized_link)
+                skipped_count += 1
+                continue
+            raw_title = _clean_text(entry.get("title"))
+            if not is_article_title(raw_title):
+                logger.info("Skipping multimedia clip entry #%d (%s)", idx, raw_title)
                 skipped_count += 1
                 continue
         except ValueError as exc:

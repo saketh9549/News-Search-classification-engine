@@ -334,3 +334,71 @@ def test_robots_bom_interleave_recovery_and_403_domain_skip(tmp_path: Path) -> N
         assert normalize_url("https://site-c.example/blocked-2") not in statuses_by_url
     finally:
         conn.close()
+
+
+def test_async_polite_crawler_concurrent_domains_and_per_host_delay(tmp_path: Path) -> None:
+    """Verify AsyncPoliteCrawler enforces >= 5s per host while crawling distinct domains concurrently."""
+    import asyncio
+
+    from src.crawler import AsyncPoliteCrawler
+    from src.models.urls import normalize_url
+
+    db_path = tmp_path / "async_crawl.db"
+    init_db(db_path)
+    conn = get_connection(db_path)
+    try:
+        enqueue_frontier_items(
+            conn,
+            [
+                FrontierItem(feed_id=1, url="https://alpha.example/a1", domain="alpha.example"),
+                FrontierItem(feed_id=1, url="https://alpha.example/a2", domain="alpha.example"),
+                FrontierItem(feed_id=2, url="https://beta.example/b1", domain="beta.example"),
+                FrontierItem(feed_id=2, url="https://beta.example/secret/no", domain="beta.example"),
+            ],
+        )
+
+        mono = [100.0]
+        sleeps: list[float] = []
+
+        async def fake_asleep(sec: float) -> None:
+            sleeps.append(sec)
+            mono[0] += sec
+
+        with respx.mock(assert_all_called=False) as mock_http:
+            mock_http.get("https://alpha.example/robots.txt").mock(return_value=httpx.Response(404))
+            mock_http.get("https://beta.example/robots.txt").mock(
+                return_value=httpx.Response(200, text="User-agent: *\nDisallow: /secret/\n")
+            )
+            mock_http.get("https://alpha.example/a1").mock(
+                return_value=httpx.Response(200, text="<html><body>A1</body></html>", headers={"content-type": "text/html"})
+            )
+            mock_http.get("https://alpha.example/a2").mock(
+                return_value=httpx.Response(200, text="<html><body>A2</body></html>", headers={"content-type": "text/html"})
+            )
+            mock_http.get("https://beta.example/b1").mock(
+                return_value=httpx.Response(200, text="<html><body>B1</body></html>", headers={"content-type": "text/html"})
+            )
+
+            async def _run() -> list:
+                async with httpx.AsyncClient() as client:
+                    crawler = AsyncPoliteCrawler(
+                        conn,
+                        client=client,
+                        min_domain_delay=5.0,
+                        monotonic_fn=lambda: mono[0],
+                        sleep_fn=fake_asleep,
+                    )
+                    return await crawler.crawl_pending(limit=10, max_concurrency=4)
+
+            results = asyncio.run(_run())
+
+        by_url = {r.url: r.status for r in results}
+        assert by_url[normalize_url("https://alpha.example/a1")] == FrontierStatus.FETCHED
+        assert by_url[normalize_url("https://alpha.example/a2")] == FrontierStatus.FETCHED
+        assert by_url[normalize_url("https://beta.example/b1")] == FrontierStatus.FETCHED
+        assert by_url[normalize_url("https://beta.example/secret/no")] == FrontierStatus.SKIPPED
+        # Must enforce >= 5.0s per-host waits (robots->a1, a1->a2, robots->b1)
+        assert len(sleeps) >= 2
+        assert all(s >= 5.0 - 1e-6 for s in sleeps)
+    finally:
+        conn.close()
